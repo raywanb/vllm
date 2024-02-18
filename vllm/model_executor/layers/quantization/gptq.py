@@ -185,7 +185,6 @@ class GPTQLinearMethod(LinearMethodBase):
                 input_size_per_partition // STORAGE_BITS_SIZE *
                 self.quant_config.weight_bits,
                 output_size_per_partition,
-                device="cuda",
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -204,7 +203,6 @@ class GPTQLinearMethod(LinearMethodBase):
                     i // self.quant_config.group_size
                     for i in range(input_size_per_partition)
                 ],
-                device="cuda",
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -216,7 +214,6 @@ class GPTQLinearMethod(LinearMethodBase):
                 scale_and_zero_size,
                 output_size_per_partition // STORAGE_BITS_SIZE *
                 self.quant_config.weight_bits,
-                device="cuda",
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -233,7 +230,6 @@ class GPTQLinearMethod(LinearMethodBase):
             torch.empty(
                 scale_and_zero_size,
                 output_size_per_partition,
-                device="cuda",
                 dtype=params_dtype,
             ),
             requires_grad=False,
