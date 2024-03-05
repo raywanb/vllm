@@ -83,7 +83,6 @@ class ModelRunner:
     def load_model(self) -> None:
         self.model = get_model(self.model_config, self.device_config,
                                self.lora_config)
-
         vocab_size = self.model.config.vocab_size
 
         if self.lora_config:

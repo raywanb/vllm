@@ -200,10 +200,9 @@ class GPTBigCodeModel(nn.Module):
 
         self.embed_dim = config.hidden_size
         lora_vocab = (lora_config.lora_extra_vocab_size * (lora_config.max_loras or 1)) if lora_config else 0
-        lora_config.max
         self.vocab_size = config.vocab_size + lora_vocab
-        self.wte = VocabParallelEmbedding(self.vocab_size, self.embed_dim)
-        self.max_position_embeddings = config.max_position_embeddings + lora_config.max_loras if lora_config else config.max_position_embeddings
+        self.wte = VocabParallelEmbedding(self.vocab_size, self.embed_dim, org_num_embeddings=config.vocab_size)
+        self.max_position_embeddings = config.max_position_embeddings
         self.wpe = nn.Embedding(self.max_position_embeddings, self.embed_dim)
         self.h = nn.ModuleList([
             GPTBigCodeBlock(config, linear_method)
@@ -232,17 +231,39 @@ class GPTBigCodeModel(nn.Module):
 
 class GPTBigCodeForCausalLM(nn.Module):
 
+    packed_modules_mapping = {
+        "c_attn": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "c_fc": [
+            "fc_in",
+        ],
+        "c_proj": [
+            "fc_out",
+        ],
+    }
     supported_lora_modules = [
         "c_attn",
+        "c_fc",  
         "c_proj",
-        "q_attn"
+        "wte",
+        "lm_head_weight",
     ]
+
+    embedding_modules = {
+        "wte": "input_embeddings",
+        "lm_head_weight": "output_embeddings",
+    }
+
+    embedding_padding_modules = ['lm_head_weight']
 
     def __init__(
         self,
         config: GPTBigCodeConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        lora_config: Optional[LoraConfig] = None,
+        lora_config: Optional[LoRAConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -252,7 +273,9 @@ class GPTBigCodeForCausalLM(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
         if lora_config: 
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-        
+        print("HERERERERE")
+        print("Unpadded vocab size: ", self.unpadded_vocab_size)
+        print("Vocab size: ", config.vocab_size)
         self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
 
     def forward(
@@ -275,11 +298,21 @@ class GPTBigCodeForCausalLM(nn.Module):
                                    sampling_metadata)
         return next_tokens
 
+   
+
+    
     def load_weights(self,
-                     model_name_or_path: str,
-                     cache_dir: Optional[str] = None,
-                     load_format: str = "auto",
-                     revision: Optional[str] = None):
+                    model_name_or_path: str,
+                    cache_dir: Optional[str] = None,
+                    load_format: str = "auto",
+                    revision: Optional[str] = None):
+        lora_params_mapping = [
+            ("attn.c_attn", "attn.q_proj", "q"),
+            ("attn.c_attn", "attn.k_proj", "k"),
+            ("attn.c_attn", "attn.v_proj", "v"),
+            ("mlp.c_fc", "mlp.fc_in", 0),
+            ("mlp.c_proj", "mlp.fc_out", 1),
+        ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
@@ -289,7 +322,17 @@ class GPTBigCodeForCausalLM(nn.Module):
                 # Skip attention mask.
                 # NOTE: "c_attn.bias" should not be skipped.
                 continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader",
-                                    default_weight_loader)
-            weight_loader(param, loaded_weight)
+
+            for (param_name, weight_name, shard_id) in lora_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight)
+                break
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
