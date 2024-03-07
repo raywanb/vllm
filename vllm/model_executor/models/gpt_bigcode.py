@@ -236,12 +236,12 @@ class GPTBigCodeForCausalLM(nn.Module):
             "k_proj",
             "v_proj",
         ],
-        "c_fc": [
-            "fc_in",
-        ],
-        "c_proj": [
-            "fc_out",
-        ],
+        # "c_fc": [
+        #     "fc_in",
+        # ],
+        # "c_proj": [
+        #     "fc_out",
+        # ],
     }
     supported_lora_modules = [
         "c_attn",
@@ -265,6 +265,7 @@ class GPTBigCodeForCausalLM(nn.Module):
         lora_config: Optional[LoRAConfig] = None,
     ):
         super().__init__()
+        print(lora_config)
         self.config = config
         self.linear_method = linear_method
         self.transformer = GPTBigCodeModel(config, linear_method, lora_config=lora_config)
@@ -272,7 +273,6 @@ class GPTBigCodeForCausalLM(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
         if lora_config: 
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-        print("HERERERERE")
         print("Unpadded vocab size: ", self.unpadded_vocab_size)
         print("Vocab size: ", config.vocab_size)
         self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
@@ -323,7 +323,6 @@ class GPTBigCodeForCausalLM(nn.Module):
                 continue
 
             for (param_name, weight_name, shard_id) in lora_params_mapping:
-                break
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
