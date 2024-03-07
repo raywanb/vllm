@@ -235,13 +235,7 @@ class GPTBigCodeForCausalLM(nn.Module):
             "q_proj",
             "k_proj",
             "v_proj",
-        ],
-        # "c_fc": [
-        #     "fc_in",
-        # ],
-        # "c_proj": [
-        #     "fc_out",
-        # ],
+        ]
     }
     supported_lora_modules = [
         "c_attn",
@@ -313,6 +307,7 @@ class GPTBigCodeForCausalLM(nn.Module):
             ("mlp.c_proj", "mlp.fc_out", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        print("layers", params_dict.keys())
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
             if "lm_head.weight" in name:
