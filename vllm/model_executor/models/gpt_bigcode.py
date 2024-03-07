@@ -230,7 +230,6 @@ class GPTBigCodeModel(nn.Module):
 
 
 class GPTBigCodeForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "c_attn": [
             "q_proj",
@@ -249,15 +248,15 @@ class GPTBigCodeForCausalLM(nn.Module):
         "c_fc",  
         "c_proj",
         "wte",
-        "lm_head_weight",
+        "lm_head.weight",
     ]
 
     embedding_modules = {
         "wte": "input_embeddings",
-        "lm_head_weight": "output_embeddings",
+        "lm_head.weight": "output_embeddings",
     }
 
-    embedding_padding_modules = ['lm_head_weight']
+    embedding_padding_modules = ['lm_head.weight']
 
     def __init__(
         self,
@@ -324,13 +323,13 @@ class GPTBigCodeForCausalLM(nn.Module):
                 continue
 
             for (param_name, weight_name, shard_id) in lora_params_mapping:
+                break
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight)
-                break
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
