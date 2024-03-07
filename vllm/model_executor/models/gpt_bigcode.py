@@ -328,7 +328,7 @@ class GPTBigCodeForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight)
+                weight_loader(param, loaded_weight, shard_id)
             else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
