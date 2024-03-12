@@ -251,7 +251,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size, sum(output_sizes), bias, gather_output,
                          skip_bias_add, params_dtype, linear_method)
-
+    # NOTE: here is where merged column
     def weight_loader(self,
                       param: Parameter,
                       loaded_weight: torch.Tensor,

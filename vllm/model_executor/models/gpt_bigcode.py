@@ -33,7 +33,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding)
+    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_world_size)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -231,26 +231,26 @@ class GPTBigCodeModel(nn.Module):
 
 class GPTBigCodeForCausalLM(nn.Module):
     packed_modules_mapping = {
-        "c_attn": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ]
+        # "c_attn": [
+        #     "q_proj",
+        #     "k_proj",
+        #     "v_proj",
+        # ]
     }
     supported_lora_modules = [
         "c_attn",
         "c_fc",  
         "c_proj",
         "wte",
-        "lm_head.weight",
+        "lm_head",
     ]
 
     embedding_modules = {
         "wte": "input_embeddings",
-        "lm_head.weight": "output_embeddings",
+        "lm_head": "output_embeddings",
     }
 
-    embedding_padding_modules = ['lm_head.weight']
+    embedding_padding_modules = ['lm_head']
 
     def __init__(
         self,
@@ -269,6 +269,15 @@ class GPTBigCodeForCausalLM(nn.Module):
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
         print("Unpadded vocab size: ", self.unpadded_vocab_size)
         print("Vocab size: ", config.vocab_size)
+        # self.lm_head = ParallelLMHead(
+        #     self.unpadded_vocab_size,
+        #     config.hidden_size,
+        #     org_num_embeddings=config.vocab_size,
+        #     padding_size=DEFAULT_VOCAB_PADDING_SIZE
+        #     # We need bigger padding if using lora for kernel
+        #     # compatibility
+        #     if not lora_config else lora_config.lora_vocab_padding_size,
+        # )
         self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
 
     def forward(
@@ -290,9 +299,6 @@ class GPTBigCodeForCausalLM(nn.Module):
         next_tokens = self.sampler(self.lm_head_weight, hidden_states,
                                    sampling_metadata)
         return next_tokens
-
-   
-
     
     def load_weights(self,
                     model_name_or_path: str,
@@ -300,14 +306,41 @@ class GPTBigCodeForCausalLM(nn.Module):
                     load_format: str = "auto",
                     revision: Optional[str] = None):
         lora_params_mapping = [
-            ("attn.c_attn", "attn.q_proj", "q"),
-            ("attn.c_attn", "attn.k_proj", "k"),
-            ("attn.c_attn", "attn.v_proj", "v"),
-            ("mlp.c_fc", "mlp.fc_in", 0),
-            ("mlp.c_proj", "mlp.fc_out", 1),
+            # ("c_attn", "c_attn", None),
+            # ("attn.c_attn", "attn.k_proj", "k"),
+            # ("attn.c_attn", "attn.v_proj", "v"),
+            # ("attn.c_proj", "attn.c_proj", None),
+            # ("mlp.c_fc", "mlp.fc_in", 0),
+            # ("mlp.c_proj", "mlp.fc_out", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        print("layers", params_dict.keys())
+        # print("layers", params_dict.keys())
+        # important = [name for name, k in hf_model_weights_iterator(
+        #         model_name_or_path, cache_dir, load_format, revision)]
+        # print("NAMES", important)
+
+        # for name, loaded_weight in hf_model_weights_iterator(
+        #         model_name_or_path, cache_dir, load_format, revision):
+        #     if "lm_head.weight" in name:
+        #         continue
+        #     if ".attn.bias" in name:
+        #         # Skip attention mask.
+        #         # NOTE: "c_attn.bias" should not be skipped.
+        #         continue
+
+        #     for (param_name, weight_name, shard_id) in lora_params_mapping:
+        #         if weight_name not in name:
+        #             continue
+        #         name = name.replace(weight_name, param_name)
+        #         param = params_dict[name]
+        #         weight_loader = param.weight_loader
+        #         weight_loader(param, loaded_weight, shard_id)
+        #     else:
+        #         param = params_dict[name]
+        #         weight_loader = getattr(param, "weight_loader",
+        #                                 default_weight_loader)
+        #         weight_loader(param, loaded_weight)
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
             if "lm_head.weight" in name:
@@ -316,16 +349,7 @@ class GPTBigCodeForCausalLM(nn.Module):
                 # Skip attention mask.
                 # NOTE: "c_attn.bias" should not be skipped.
                 continue
-
-            for (param_name, weight_name, shard_id) in lora_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)

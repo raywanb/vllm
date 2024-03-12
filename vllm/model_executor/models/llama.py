@@ -314,8 +314,11 @@ class LlamaForCausalLM(nn.Module):
         self.linear_method = linear_method
         self.model = LlamaModel(config, linear_method, lora_config=lora_config)
         self.unpadded_vocab_size = config.vocab_size
+        print("UNPADDED", self.unpadded_vocab_size)
+
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        print("PADDED", self.unpadded_vocab_size)
         self.lm_head = ParallelLMHead(
             self.unpadded_vocab_size,
             config.hidden_size,
@@ -323,7 +326,7 @@ class LlamaForCausalLM(nn.Module):
             padding_size=DEFAULT_VOCAB_PADDING_SIZE
             # We need bigger padding if using lora for kernel
             # compatibility
-            if not lora_config else lora_config.lora_vocab_padding_size,
+            if not lora_config else lorza_config.lora_vocab_padding_size,
         )
         self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
 
@@ -361,6 +364,8 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
+        print("layers", params_dict.keys())
+        print("NAMES", [name for name, k in hf_model_weights_iterator(model_name_or_path, cache_dir, load_format, revision)])
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
             if "rotary_emb.inv_freq" in name:
@@ -389,3 +394,4 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+    
