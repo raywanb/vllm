@@ -4,6 +4,10 @@ import warnings
 import dataclasses
 import torch
 
+## questions: look over the control.py forward pass and see if I'm implementing it correctly in MixtralDecoderLayer
+## it seems that the original code is wrapping each layer in a ControlModule class, which is then used to apply the control vector
+## but I'm not sure if I need to do that, or if I can just apply the control vector directly to the layer.
+## if yes, then I'll prolly need to take an approach similar to Lora?
 @dataclasses.dataclass
 class BlockControlParams:
     control: torch.Tensor | None = None
