@@ -1,13 +1,29 @@
-from typing import Iterable
+import typing
 import numpy as np
 import warnings
 import dataclasses
+import torch
 
+@dataclasses.dataclass
+class BlockControlParams:
+    control: torch.Tensor | None = None
+    normalize: bool = False
+    operator: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
+        lambda current, control: current + control
+    )
 
+    @classmethod
+    def default(cls) -> "BlockControlParams":
+        return cls()
+    
 
 class ControlVector:
     model_type: str
     directions: dict[int, np.ndarray]
+    
+    def __init__(self, model_type: str, directions: dict[int, np.ndarray]) -> None:
+        self.model_type = model_type
+        self.directions = directions
 
     def _helper_combine(
         self, other: "ControlVector", other_coeff: float
@@ -62,13 +78,3 @@ class ControlVector:
         return self.__mul__(1 / other)
 
     
-class CVConfig:
-    layer_ids: Iterable[int]
-    control_vector: ControlVector
-
-    def __init__(self, layer_ids: Iterable[int], control_vector: ControlVector):
-        self.layer_ids = layer_ids
-        self.control_vector = control_vector
-    
-    
-

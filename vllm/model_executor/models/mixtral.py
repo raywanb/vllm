@@ -26,9 +26,10 @@ from typing import List, Optional
 import torch
 from torch import nn
 from transformers import MixtralConfig
-
+from numpy import np
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import LoRAConfig
+from vllm.config import LoRAConfig, ControlVectorConfig
+from vllm.control_vectors.layers import ControlModule, ControlVector
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -222,6 +223,7 @@ class MixtralDecoderLayer(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        control_vector: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -244,6 +246,7 @@ class MixtralDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.control_vector = torch.tensor(control_vector, dtype=torch.float32) if control_vector else None
 
     def forward(
         self,
@@ -260,6 +263,24 @@ class MixtralDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            
+        if self.control_vector is not None:
+            if len(self.control_vector.shape) == 1:
+                control = self.control_vector.view(1, 1, -1).to(hidden_states.device)
+            else:
+                control = self.control_vector.to(hidden_states.device)
+
+            # Positional masking based on provided positions
+            zero_indices = (positions == 0).cumsum(1).argmax(1, keepdim=True)
+            col_indices = torch.arange(positions.size(1), device=positions.device).unsqueeze(0)
+            mask = (col_indices >= zero_indices).float().reshape(hidden_states.shape[0], hidden_states.shape[1], 1)
+            control = control * mask
+
+            norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
+            hidden_states = hidden_states + control
+            norm_post = torch.norm(hidden_states, dim=-1, keepdim=True)
+            hidden_states = hidden_states * norm_pre / norm_post
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -281,7 +302,7 @@ class MixtralModel(nn.Module):
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
         lora_config: Optional[LoRAConfig] = None,
-        control_vector_config: Optional[CVConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_i3d
@@ -295,10 +316,15 @@ class MixtralModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
-        self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, linear_method=linear_method)
-            for _ in range(config.num_hidden_layers)
-        ])
+        
+        for layer_idx in range(config.num_hidden_layers):
+            cv = None
+            if control_vector_config and layer_idx in control_vector_config.layer_ids:
+                cv = control_vector_config.get_control_vector(layer_idx)
+                # if cv:
+                #     control_module = ControlModule(cv)
+            layer = MixtralDecoderLayer(config, linear_method=linear_method, control_vector=cv)
+            self.layers.append(layer)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(

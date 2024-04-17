@@ -2,12 +2,13 @@ import enum
 import json
 import os
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, ClassVar, Optional, Union
+from typing import TYPE_CHECKING, ClassVar, Optional, Union, List
 
 import torch
 from packaging.version import Version
 from transformers import PretrainedConfig
-
+from numpy import np
+from vllm.control_vectors.layers import ControlVector
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_text_config
 from vllm.utils import (get_cpu_memory, get_nvcc_cuda_version, is_cpu, is_hip,
@@ -836,6 +837,20 @@ class LoRAConfig:
                 "max_num_batched_tokens must be <= 65528 when "
                 "LoRA is enabled.")
 
+@dataclass
+class ControlVectorConfig:
+    layer_ids: List[int]
+    control_vector: Optional[ControlVector]
+    coefficient: Optional[float]=1.0
+
+    def get_control_vector(self, layer_id: int) -> Optional[np.ndarray]:
+        """Retrieves the control vector for the specified layer, if it exists."""
+        try:
+            index = self.layer_ids.index(layer_id)
+            return self.control_vector.directions[index]
+        except ValueError:
+            return None
+    
 
 @dataclass
 class VisionLanguageConfig:
