@@ -23,6 +23,11 @@
 """Inference-only Mixtral model."""
 from typing import List, Optional
 
+## questions: idk if I'm implementing it correctly in MixtralDecoderLayer the forward pass logic 
+## it seems that the original code is wrapping each layer in a ControlModule class, which is then used to apply the control vector
+## but I'm not sure if I need to do that, or if I can just apply the control vector directly to the layer.
+## if yes, then I'll prolly need to take an approach similar to Lora?
+
 import torch
 from torch import nn
 from transformers import MixtralConfig
@@ -247,7 +252,8 @@ class MixtralDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
         self.control_vector = torch.tensor(control_vector, dtype=torch.float32) if control_vector else None
-
+        self.normalize = False
+        
     def forward(
         self,
         positions: torch.Tensor,
@@ -263,24 +269,7 @@ class MixtralDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-            
-        if self.control_vector is not None:
-            if len(self.control_vector.shape) == 1:
-                control = self.control_vector.view(1, 1, -1).to(hidden_states.device)
-            else:
-                control = self.control_vector.to(hidden_states.device)
-
-            # Positional masking based on provided positions
-            zero_indices = (positions == 0).cumsum(1).argmax(1, keepdim=True)
-            col_indices = torch.arange(positions.size(1), device=positions.device).unsqueeze(0)
-            mask = (col_indices >= zero_indices).float().reshape(hidden_states.shape[0], hidden_states.shape[1], 1)
-            control = control * mask
-
-            norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
-            hidden_states = hidden_states + control
-            norm_post = torch.norm(hidden_states, dim=-1, keepdim=True)
-            hidden_states = hidden_states * norm_pre / norm_post
-
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -292,6 +281,22 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.block_sparse_moe(hidden_states)
+
+        if self.control_vector is not None:
+            control = self.control_vector.to(hidden_states.device)
+            if len(self.control_vector.shape) == 1:
+                control = control.view(1, 1, -1)
+
+            zero_indices = (positions == 0).cumsum(1).argmax(1, keepdim=True)
+            col_indices = torch.arange(positions.size(1), device=positions.device).unsqueeze(0)
+            mask = (col_indices >= zero_indices).float().reshape(hidden_states.shape[0], hidden_states.shape[1], 1)
+            control = control * mask
+
+            hidden_states += control
+            if self.normalize:
+                norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
+                hidden_states = hidden_states * (norm_pre / torch.norm(hidden_states, dim=-1, keepdim=True))
+                
         return hidden_states, residual
 
 
