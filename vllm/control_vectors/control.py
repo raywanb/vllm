@@ -1,4 +1,4 @@
-import typing
+from typing import Dict, Callable
 import numpy as np
 import warnings
 import dataclasses
@@ -10,9 +10,9 @@ import torch
 ## if yes, then I'll prolly need to take an approach similar to Lora?
 @dataclasses.dataclass
 class BlockControlParams:
-    control: torch.Tensor | None = None
+    control: torch.Tensor = None
     normalize: bool = False
-    operator: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
+    operator: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
         lambda current, control: current + control
     )
 
@@ -23,9 +23,9 @@ class BlockControlParams:
 
 class ControlVector:
     model_type: str
-    directions: dict[int, np.ndarray]
+    directions: Dict[int, np.ndarray]
     
-    def __init__(self, model_type: str, directions: dict[int, np.ndarray]) -> None:
+    def __init__(self, model_type: str, directions: Dict[int, np.ndarray]) -> None:
         self.model_type = model_type
         self.directions = directions
 
@@ -69,16 +69,16 @@ class ControlVector:
             directions[layer] = -self.directions[layer]
         return ControlVector(model_type=self.model_type, directions=directions)
 
-    def __mul__(self, other: int | float | np.int_ | np.float_) -> "ControlVector":
+    def __mul__(self, other) -> "ControlVector":
         directions: dict[int, np.ndarray] = {}
         for layer in self.directions:
             directions[layer] = other * self.directions[layer]
         return ControlVector(model_type=self.model_type, directions=directions)
 
-    def __rmul__(self, other: int | float | np.int_ | np.float_) -> "ControlVector":
+    def __rmul__(self, other) -> "ControlVector":
         return self.__mul__(other)
 
-    def __truediv__(self, other: int | float | np.int_ | np.float_) -> "ControlVector":
+    def __truediv__(self, other) -> "ControlVector":
         return self.__mul__(1 / other)
 
     

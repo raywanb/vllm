@@ -846,8 +846,7 @@ class ControlVectorConfig:
     def get_control_vector(self, layer_id: int) -> Optional[np.ndarray]:
         """Retrieves the control vector for the specified layer, if it exists."""
         try:
-            index = self.layer_ids.index(layer_id)
-            return self.control_vector.directions[index]
+            return self.control_vector.directions[layer_id]
         except ValueError:
             return None
     
@@ -1041,6 +1040,7 @@ class EngineConfig:
     lora_config: Optional[LoRAConfig]
     vision_language_config: Optional[VisionLanguageConfig]
     speculative_config: Optional[SpeculativeConfig]
+    control_vector_config: Optional[ControlVectorConfig]
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.

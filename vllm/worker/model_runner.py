@@ -10,7 +10,7 @@ import torch.nn as nn
 from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
                             get_attn_backend)
 from vllm.config import (DeviceConfig, LoRAConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig, VisionLanguageConfig)
+                         SchedulerConfig, VisionLanguageConfig, ControlVectorConfig)
 from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce
 from vllm.distributed.device_communicators import (custom_all_reduce,
                                                    pynccl_utils)
@@ -111,13 +111,14 @@ class ModelRunner:
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
         vision_language_config: Optional[VisionLanguageConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
         self.is_driver_worker = is_driver_worker
-
+        self.control_vector_config = control_vector_config
         # model_config can be None in tests/samplers/test_sampler.py.
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
         self.sliding_window = (model_config.get_sliding_window()
@@ -158,7 +159,8 @@ class ModelRunner:
                 lora_config=self.lora_config,
                 vision_language_config=self.vision_language_config,
                 parallel_config=self.parallel_config,
-                scheduler_config=self.scheduler_config)
+                scheduler_config=self.scheduler_config,
+                control_vector_config=self.control_vector_config)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(f"Loading model weights took "

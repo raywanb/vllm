@@ -2,7 +2,7 @@ from typing import Dict, List, Optional
 
 from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, SpeculativeConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, ControlVectorConfig)
 from vllm.executor.executor_base import ExecutorAsyncBase, ExecutorBase
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -25,6 +25,7 @@ class GPUExecutor(ExecutorBase):
         lora_config: Optional[LoRAConfig],
         vision_language_config: Optional[VisionLanguageConfig],
         speculative_config: Optional[SpeculativeConfig],
+        control_vector_config: Optional[ControlVectorConfig]
     ) -> None:
         self.model_config = model_config
         self.cache_config = cache_config
@@ -33,6 +34,7 @@ class GPUExecutor(ExecutorBase):
         self.scheduler_config = scheduler_config
         self.device_config = device_config
         self.vision_language_config = vision_language_config
+        self.control_vector_config = control_vector_config
 
         assert (not speculative_config
                 ), "Speculative decoding not yet supported for GPU backend"
@@ -61,6 +63,7 @@ class GPUExecutor(ExecutorBase):
             distributed_init_method=distributed_init_method,
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
+            control_vector_config=self.control_vector_config,
             is_driver_worker=True,
         )
         self.driver_worker.init_device()

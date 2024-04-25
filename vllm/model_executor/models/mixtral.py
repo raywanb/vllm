@@ -309,6 +309,8 @@ class MixtralModel(nn.Module):
         lora_config: Optional[LoRAConfig] = None,
         control_vector_config: Optional[ControlVectorConfig] = None,
     ) -> None:
+        print("HERERERERERRERERER")
+        print("HELLOOOO APPLES")
         super().__init__()
         self.padding_idx = config.pad_token_i3d
         lora_vocab = (lora_config.lora_extra_vocab_size *

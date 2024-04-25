@@ -446,6 +446,8 @@ class EngineArgs:
             num_speculative_tokens=self.num_speculative_tokens,
         )
 
+        control_vector_config = self.control_vector_config
+
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
@@ -488,7 +490,8 @@ class EngineArgs:
                             device_config=device_config,
                             lora_config=lora_config,
                             vision_language_config=vision_language_config,
-                            speculative_config=speculative_config)
+                            speculative_config=speculative_config,
+                            control_vector_config=control_vector_config)
 
 
 @dataclass

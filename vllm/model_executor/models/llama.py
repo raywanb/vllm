@@ -27,8 +27,9 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+import numpy as np
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import LoRAConfig
+from vllm.config import LoRAConfig, ControlVectorConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -176,6 +177,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        control_vector: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -210,6 +212,8 @@ class LlamaDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.control_vector = control_vector    
+        self.normalize = True
 
     def forward(
         self,
@@ -237,6 +241,48 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        
+        # print(hidden_states.device.type)
+        # print(positions.dtype)
+        if self.control_vector is not None:
+            norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
+            print(self.control_vector)
+            if isinstance(self.control_vector, np.ndarray):
+                self.control_vector = torch.tensor(0.5 * self.control_vector, dtype=hidden_states.dtype)
+
+            print("very start control vector", self.control_vector)
+            control = self.control_vector.to(hidden_states.device)
+
+            print("after to", control)
+            if len(control.shape) == 1:
+                # Expand control to be broadcastable to each sequence position, but keep its own feature size
+                control = control.view(1, -1).expand(hidden_states.shape[0], -1)  # Now [14000, 4096]
+
+            # print("Expanded control shape:", control.shape)
+
+            if positions.ndim == 1:
+                positions = positions.unsqueeze(0)
+
+            zero_indices = (positions == 0).cumsum(1).argmax(1, keepdim=True)
+            col_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device).unsqueeze(1)
+
+            mask = (col_indices >= zero_indices).float().unsqueeze(-1)  # Ensure mask is [14000, 1, 1]
+            mask = mask.expand(-1, -1, hidden_states.shape[1])  # Expand mask to [14000, 1, 4096]
+
+            print("Control vector sample:", control[0, :10])  # Print first 10 features of the first batch
+            print("Mask sample:", mask[0, 0, :10])  # Print first 10 mask values of the first batch
+
+            # Ensure control matches the hidden_states dimensions before applying mask
+            # Note: Since control is already [14000, 4096], we use it directly with expanded mask
+            control = control * mask.squeeze(1)  # Squeezing mask to remove the singleton dimension for multiplication
+            print("Control vector sample after:", control[0, :10])  # Print first 10 features of the first batch
+
+            hidden_states += control  # Add the modified control to hidden_states
+
+            if self.normalize:
+                hidden_states = hidden_states * (norm_pre / torch.norm(hidden_states, dim=-1, keepdim=True))
+
+
         return hidden_states, residual
 
 
@@ -247,6 +293,7 @@ class LlamaModel(nn.Module):
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
         lora_config: Optional[LoRAConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None
     ) -> None:
         super().__init__()
         self.config = config
@@ -260,10 +307,22 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
-        self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, linear_method)
-            for _ in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList()
+        # self.layers = nn.ModuleList([
+        #     LlamaDecoderLayer(config, linear_method)
+        #     for _ in range(config.num_hidden_layers)
+        # ])
+
+        print("CONTROL VECTOR CONFIG", control_vector_config)
+        for layer_idx in range(config.num_hidden_layers):
+            cv = None
+            if control_vector_config and layer_idx in control_vector_config.layer_ids:
+                print(layer_idx)
+                cv = control_vector_config.get_control_vector(layer_idx)
+                # if cv:
+                #     control_module = ControlModule(cv)
+            layer = LlamaDecoderLayer(config, linear_method=linear_method, control_vector=cv)
+            self.layers.append(layer)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -328,11 +387,13 @@ class LlamaForCausalLM(nn.Module):
         config: LlamaConfig,
         linear_method: Optional[LinearMethodBase] = None,
         lora_config: Optional[LoRAConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = LlamaModel(config, linear_method, lora_config=lora_config)
+        print("CONTROL VECTORS", control_vector_config)
+        self.model = LlamaModel(config, linear_method, lora_config=lora_config, control_vector_config=control_vector_config)
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size

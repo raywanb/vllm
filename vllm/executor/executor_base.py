@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from vllm.config import (CacheConfig, DeviceConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, SpeculativeConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, ControlVectorConfig)
 from vllm.lora.request import LoRARequest
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 
@@ -27,11 +27,12 @@ class ExecutorBase(ABC):
         lora_config: Optional[LoRAConfig],
         vision_language_config: Optional[VisionLanguageConfig],
         speculative_config: Optional[SpeculativeConfig],
+        control_vector_config: Optional[ControlVectorConfig]
     ) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def determine_num_available_blocks(self) -> tuple[int, int]:
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Determine the number of available blocks for the GPU KV cache and
         swappable CPU KV cache.
 

@@ -51,6 +51,7 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
               **kwargs) -> nn.Module:
     lora_config = kwargs.get("lora_config", None)
     vision_language_config = kwargs.get("vision_language_config", None)
+    control_vector_config = kwargs.get("control_vector_config", None)
     model_class = _get_model_architecture(model_config)[0]
 
     # Get the (maybe quantized) linear method.
@@ -79,7 +80,9 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
         with torch.device(device_config.device):
             if hasattr(model_class, "supported_lora_modules"):
                 model = model_class(model_config.hf_config, linear_method,
-                                    lora_config)
+                                    lora_config, control_vector_config)
+            elif control_vector_config:
+                model = model_class(model_config.hf_config, linear_method, lora_config, control_vector_config)
             elif lora_config:
                 raise ValueError(
                     f"Model {model_class.__name__} does not support LoRA, "

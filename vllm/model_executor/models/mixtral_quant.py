@@ -333,6 +333,7 @@ class MixtralForCausalLM(nn.Module):
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
+        print("MISTRAL HERERERERE")
         super().__init__()
         self.config = config
         self.linear_method = linear_method
