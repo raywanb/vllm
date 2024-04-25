@@ -6,7 +6,7 @@ from typing import Optional
 from vllm.config import (CacheConfig, DeviceConfig, EngineConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          SpeculativeConfig, TokenizerPoolConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, ControlVectorConfig)
 from vllm.utils import str_to_int_tuple
 
 
@@ -57,7 +57,7 @@ class EngineArgs:
     ray_workers_use_nsight: bool = False
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
-
+    control_vector_config: Optional[ControlVectorConfig] = None
     # Related to Vision-language models such as llava
     image_input_type: Optional[str] = None
     image_token_id: Optional[int] = None

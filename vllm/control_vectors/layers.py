@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.control_vectors.control import ControlVector
-from vllm.config import ControlVectorConfig
         
 def _apply_control_vector(
     x: torch.Tensor,

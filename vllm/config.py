@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional, Union, List
 import torch
 from packaging.version import Version
 from transformers import PretrainedConfig
-from numpy import np
+import numpy as np
 from vllm.control_vectors.layers import ControlVector
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_text_config

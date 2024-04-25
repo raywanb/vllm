@@ -377,13 +377,17 @@ class MixtralForCausalLM(nn.Module):
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
         lora_config: Optional[LoRAConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
+        print("CONTROL VECTOR", control_vector_config)
         self.model = MixtralModel(config,
                                   linear_method,
-                                  lora_config=lora_config)
+                                  lora_config=lora_config,
+                                  control_vector_config=control_vector_config)
+
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
