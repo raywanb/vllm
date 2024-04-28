@@ -14,6 +14,7 @@ from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
 from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce
 from vllm.distributed.device_communicators import (custom_all_reduce,
                                                    pynccl_utils)
+from vllm.control_vectors.models import ControlVectorManager, create_cv_manager
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
@@ -187,6 +188,11 @@ class ModelRunner:
                 self.lora_config, self.device, self.model.embedding_modules,
                 self.model.embedding_padding_modules)
             self.model = self.lora_manager.create_lora_manager(self.model)
+
+        ##TODO: ADD STUFF HERE
+        if self.enable_control_vectors:
+            self.control_vector_manager = create_cv_manager(self.model, self.control_vector_config)
+            self.model = self.control_vector_manager.model
 
         if self.kv_cache_dtype == "fp8" and is_hip():
             # Currently scaled KV cache is only enabled on ROCm

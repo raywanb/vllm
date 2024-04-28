@@ -61,6 +61,7 @@ class EngineArgs:
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
     model_loader_extra_config: Optional[dict] = None
+    enable_control_vectors: bool = False
 
     # Related to Vision-language models such as llava
     image_input_type: Optional[str] = None

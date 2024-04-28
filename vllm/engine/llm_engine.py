@@ -141,6 +141,7 @@ class LLMEngine:
         self.load_config = load_config
         self.decoding_config = decoding_config or DecodingConfig()
         self.log_stats = log_stats
+        self.enable_control_vectors = True
 
         if not self.model_config.skip_tokenizer_init:
             self.tokenizer: BaseTokenizerGroup

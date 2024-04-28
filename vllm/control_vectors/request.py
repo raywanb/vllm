@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ControlVectorAdapter:
+    name: str
     control_vector: ControlVector
     coefficient: float = 1.0
     normalize: bool = False
