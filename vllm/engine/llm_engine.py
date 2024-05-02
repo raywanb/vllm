@@ -5,9 +5,9 @@ from transformers import GenerationConfig, PreTrainedTokenizer
 
 import vllm
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig, LoadConfig,
-                         LoRAConfig, ModelConfig, ParallelConfig,
+                         LoRAConfig, ModelConfig, ParallelConfig, 
                          SchedulerConfig, SpeculativeConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, ControlVectorConfig)
 from vllm.core.scheduler import Scheduler, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.metrics import StatLogger, Stats
@@ -28,6 +28,7 @@ from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
                                                      get_tokenizer_group)
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.utils import Counter
 
 logger = init_logger(__name__)
@@ -88,6 +89,7 @@ class LLMEngine:
         device_config: DeviceConfig,
         load_config: LoadConfig,
         lora_config: Optional[LoRAConfig],
+        control_vector_config: Optional[ControlVectorConfig],
         vision_language_config: Optional[VisionLanguageConfig],
         speculative_config: Optional[SpeculativeConfig],
         decoding_config: Optional[DecodingConfig],
@@ -141,7 +143,7 @@ class LLMEngine:
         self.load_config = load_config
         self.decoding_config = decoding_config or DecodingConfig()
         self.log_stats = log_stats
-        self.enable_control_vectors = True
+        self.control_vector_config = control_vector_config
 
         if not self.model_config.skip_tokenizer_init:
             self.tokenizer: BaseTokenizerGroup
@@ -165,6 +167,7 @@ class LLMEngine:
             vision_language_config=vision_language_config,
             speculative_config=speculative_config,
             load_config=load_config,
+            control_vector_config=control_vector_config,
         )
 
         self._initialize_kv_caches()
@@ -355,6 +358,7 @@ class LLMEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
     ) -> None:
         """Add a request to the engine's request pool.
@@ -441,7 +445,7 @@ class LLMEngine:
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
-                                  arrival_time, lora_request, multi_modal_data)
+                                  arrival_time, lora_request, control_vector_request, multi_modal_data)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
@@ -705,6 +709,9 @@ class LLMEngine:
 
     def list_loras(self) -> List[int]:
         return self.model_executor.list_loras()
+
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> None:
+        self.model_executor.add_control_vector(control_vector_request)
 
     def check_health(self) -> None:
         self.model_executor.check_health()

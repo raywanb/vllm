@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from vllm.block import LogicalTokenBlock
 from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
+from vllm.control_vectors.request import ControlVectorRequest
 
 if TYPE_CHECKING:
     import torch
@@ -211,12 +212,14 @@ class Sequence:
         block_size: int,
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
+        cv_request: Optional[ControlVectorRequest] = None,
     ) -> None:
         self.seq_id = seq_id
         self.prompt = prompt
         self.block_size = block_size
         self.eos_token_id = eos_token_id
         self.lora_request = lora_request
+        self.cv_request = cv_request
 
         self.data: SequenceData = SequenceData(prompt_token_ids)
         self.output_logprobs: SampleLogprobs = []
@@ -411,6 +414,7 @@ class SequenceGroup:
         sampling_params: SamplingParams,
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
     ) -> None:
         self.request_id = request_id
@@ -425,6 +429,7 @@ class SequenceGroup:
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
         self.multi_modal_data = multi_modal_data
+        self.control_vector_request = control_vector_request
 
     @property
     def prompt(self) -> str:
@@ -585,6 +590,7 @@ class SequenceGroupMetadata:
         computed_block_nums: Optional[List[int]] = None,
         state: Optional[SequenceGroupState] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
@@ -597,6 +603,7 @@ class SequenceGroupMetadata:
         self.state = SequenceGroupState() if state is None else state
         self._token_chunk_size = token_chunk_size
         self.do_sample = do_sample
+        self.control_vector_request = control_vector_request
 
         if self._token_chunk_size is None:
             if is_prompt:

@@ -11,7 +11,7 @@ from torch import nn
 
 from vllm.config import (VLLM_USE_MODELSCOPE, DeviceConfig, LoadConfig,
                          LoadFormat, LoRAConfig, ModelConfig, ParallelConfig,
-                         SchedulerConfig, VisionLanguageConfig)
+                         SchedulerConfig, VisionLanguageConfig, ControlVectorConfig)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -101,8 +101,9 @@ class BaseModelLoader(ABC):
                    device_config: DeviceConfig,
                    lora_config: Optional[LoRAConfig],
                    vision_language_config: Optional[VisionLanguageConfig],
+                        control_vector_config: Optional[ControlVectorConfig],
                    parallel_config: ParallelConfig,
-                   scheduler_config: SchedulerConfig) -> nn.Module:
+                   scheduler_config: SchedulerConfig,) -> nn.Module:
         """Load a model with the given configurations."""
         ...
 
@@ -214,6 +215,7 @@ class DefaultModelLoader(BaseModelLoader):
                    device_config: DeviceConfig,
                    lora_config: Optional[LoRAConfig],
                    vision_language_config: Optional[VisionLanguageConfig],
+                   control_vector_config: Optional[ControlVectorConfig],
                    parallel_config: ParallelConfig,
                    scheduler_config: SchedulerConfig) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
@@ -252,6 +254,7 @@ class DummyModelLoader(BaseModelLoader):
                    lora_config: Optional[LoRAConfig],
                    vision_language_config: Optional[VisionLanguageConfig],
                    parallel_config: ParallelConfig,
+                   control_vector_config: Optional[ControlVectorConfig],
                    scheduler_config: SchedulerConfig) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):

@@ -941,6 +941,7 @@ class Scheduler:
                 do_sample=do_sample,
                 token_chunk_size=token_chunk_size,
                 lora_request=seq_group.lora_request,
+                control_vector_request=seq_group.control_vector_request,
                 computed_block_nums=common_computed_block_nums,
                 state=seq_group.state,
                 # `multi_modal_data` will only be present for the 1st comm

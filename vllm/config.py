@@ -909,6 +909,10 @@ class LoRAConfig:
                 "max_num_batched_tokens must be <= 65528 when "
                 "LoRA is enabled.")
 
+@dataclass 
+class ControlVectorConfig:
+    def __post__init(self):
+        print("Created Control Vector Config")
 
 @dataclass
 class VisionLanguageConfig:
@@ -1116,6 +1120,7 @@ class EngineConfig:
     vision_language_config: Optional[VisionLanguageConfig]
     speculative_config: Optional[SpeculativeConfig]
     decoding_config: Optional[DecodingConfig]
+    control_vector_config: Optional[ControlVectorConfig]
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other.

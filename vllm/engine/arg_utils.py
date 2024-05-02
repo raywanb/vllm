@@ -6,7 +6,7 @@ from typing import Optional
 from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, SpeculativeConfig,
-                         TokenizerPoolConfig, VisionLanguageConfig)
+                         TokenizerPoolConfig, VisionLanguageConfig, ControlVectorConfig)
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.utils import str_to_int_tuple
 
@@ -50,6 +50,7 @@ class EngineArgs:
     tokenizer_pool_type: str = "ray"
     tokenizer_pool_extra_config: Optional[dict] = None
     enable_lora: bool = False
+    enable_cv: bool = False
     max_loras: int = 1
     max_lora_rank: int = 16
     fully_sharded_loras: bool = False
@@ -525,6 +526,8 @@ class EngineArgs:
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
 
+        control_vector_config = ControlVectorConfig()
+
         load_config = LoadConfig(
             load_format=self.load_format,
             download_dir=self.download_dir,
@@ -559,7 +562,8 @@ class EngineArgs:
                             vision_language_config=vision_language_config,
                             speculative_config=speculative_config,
                             load_config=load_config,
-                            decoding_config=decoding_config)
+                            decoding_config=decoding_config,
+                            control_vector_config=control_vector_config)
 
 
 @dataclass

@@ -4,7 +4,7 @@ from vllm.control_vectors.control import ControlVector
 from dataclasses import dataclass, field
 
 @dataclass
-class ControlVectorAdapter:
+class ControlVectorRequest:
     name: str
     control_vector: ControlVector
     coefficient: float = 1.0

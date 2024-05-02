@@ -5,6 +5,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from vllm.engine.arg_utils import EngineArgs
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.engine.llm_engine import LLMEngine
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -137,6 +138,7 @@ class LLM:
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
@@ -205,6 +207,7 @@ class LLM:
                 if isinstance(sampling_params, list) else sampling_params,
                 token_ids,
                 lora_request=lora_request,
+                control_vector_request=control_vector_request,
                 # Get ith image while maintaining the batch dim.
                 multi_modal_data=MultiModalData(
                     type=multi_modal_data.type,
@@ -219,6 +222,7 @@ class LLM:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
+        control_vector_request: Optional[ControlVectorRequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
@@ -227,6 +231,7 @@ class LLM:
                                     sampling_params,
                                     prompt_token_ids,
                                     lora_request=lora_request,
+                                    control_vector_request=control_vector_request,
                                     multi_modal_data=multi_modal_data)
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:

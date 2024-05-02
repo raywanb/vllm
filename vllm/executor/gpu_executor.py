@@ -6,6 +6,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         make_async)
+from vllm.control_vectors.request import ControlVectorRequest
 
 logger = init_logger(__name__)
 
@@ -46,6 +47,7 @@ class GPUExecutor(ExecutorBase):
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             is_driver_worker=True,
+            control_vector_config=self.control_vector_config,
         )
         self.driver_worker.init_device()
         self.driver_worker.load_model()
@@ -75,6 +77,7 @@ class GPUExecutor(ExecutorBase):
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             is_driver_worker=True,
+            control_vector_config=self.control_vector_config,
         )
 
         draft_worker = MultiStepWorker(
@@ -91,6 +94,7 @@ class GPUExecutor(ExecutorBase):
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             is_driver_worker=True,
+            control_vector_config=self.control_vector_config,
         )
 
         spec_decode_worker = SpecDecodeWorker.from_workers(
@@ -148,6 +152,9 @@ class GPUExecutor(ExecutorBase):
 
     def list_loras(self) -> Set[int]:
         return self.driver_worker.list_loras()
+
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> None:
+        return self.driver_worker.add_control_vector(control_vector_request)
 
     def check_health(self) -> None:
         # GPUExecutor will always be healthy as long as

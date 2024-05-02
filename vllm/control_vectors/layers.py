@@ -1,29 +1,32 @@
 from vllm.control_vectors.control import ControlVector
-from vllm.control_vectors.request import ControlVectorAdapter
+from vllm.control_vectors.request import ControlVectorRequest
 import torch
+import torch.nn as nn
 
-class BaseLayerWithControlVector:
+class BaseLayerWithControlVector(nn.Module):
     pass
 
 
 
 class MLPWithControlVector(BaseLayerWithControlVector):
-    cv_vector: torch.Tensor = None
 
     def __init__(self, base_layer) -> None:
-        # super().__init__()
+        super().__init__()
         self.base_layer = base_layer
         self.normalize = True
+        self.cv_vector = None
 
     def set_cv_vector(self, cv_vector: torch.Tensor):
         self.cv_vector = cv_vector
 
     def get_cv_vector(self) -> torch.Tensor:
         return self.cv_vector
+
+    def reset_cv_vector(self):
+        self.cv_vector = None
     
     def forward(self, hidden_states, positions):
-        hidden_states = self.base_layer.forward(hidden_states)
-
+        hidden_states = self.base_layer.forward(hidden_states, positions)
         if self.cv_vector is not None:
             norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
 

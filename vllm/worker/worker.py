@@ -8,7 +8,8 @@ import torch.distributed
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, ControlVectorConfig)
+from vllm.control_vectors.request import ControlVectorRequest
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
                               init_distributed_environment)
@@ -44,6 +45,7 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
+        control_vector_config: Optional[ControlVectorConfig] = None,
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -79,6 +81,7 @@ class Worker(WorkerBase):
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
             vision_language_config=vision_language_config,
+            control_vector_config=control_vector_config,
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
@@ -261,6 +264,9 @@ class Worker(WorkerBase):
 
     def list_loras(self) -> Set[int]:
         return self.model_runner.list_loras()
+
+    def add_control_vector(self, control_vector_request: ControlVectorRequest) -> None:
+        return self.model_runner.add_control_vector(control_vector_request)
 
     @property
     def max_model_len(self) -> int:
