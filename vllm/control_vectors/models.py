@@ -9,8 +9,8 @@ import re
 import torch.nn as nn
 
 
-_all_cv_classes: Set[Type[BaseLayerWithControlVector]] = {
-    MLPWithControlVector
+_all_cv_classes = {
+    "mlp": MLPWithControlVector
 }
 
 class ControlVectorModel:
@@ -31,31 +31,34 @@ class ControlVectorModel:
 
     def _create_cv_modules(self):
         for module_name, module in self.model.named_modules():
-            if not "mlp" in module_name:
-                continue
-            if isinstance(module, MLPWithControlVector):
-                continue
-            new_module = replace_submodule(self.model, module_name, MLPWithControlVector(module))
-            self.register_module(module_name, new_module)
+            for key in _all_cv_classes:
+                if key not in module_name:
+                    continue
+                if isinstance(module, _all_cv_classes[key]):
+                    continue
+                new_module = replace_submodule(self.model, module_name, _all_cv_classes[key](module))
+                self.register_module(module_name, new_module)
     
     def set_control_vector(self):
         for module_name, module in self.model.named_modules():
-            if not "mlp" in module_name:
-                continue
-            if isinstance(module, MLPWithControlVector):
-                cv_module = module
-            else:
-                cv_module = MLPWithControlVector(module)
-                new_module = replace_submodule(self.model, module_name, cv_module)
-                self.register_module(module_name, new_module)
+            for key in _all_cv_classes:
+                if key not in module_name:
+                    continue
+                if isinstance(module, _all_cv_classes[key]):
+                    cv_module = module
+                else:
+                    cv_module = _all_cv_classes[key](module)
+                    new_module = replace_submodule(self.model, module_name, cv_module)
+                    self.register_module(module_name, new_module)
 
-            module_number = re.findall(r'\d+', module_name)
-            if self._active_control_vectors:
-                cv_vector = self._active_control_vectors[0].directions.get(int(module_number[0]), None)
-            else:
-                cv_vector = None
+                module_number = re.findall(r'\d+', module_name)
 
-            cv_module.set_cv_vector(cv_vector)
+                if self._active_control_vectors:
+                    cv_vector = self._active_control_vectors[0].directions.get(int(module_number[0]), None)
+                else:
+                    cv_vector = None
+
+                cv_module.set_cv_vector(cv_vector)
             
 
     def register_module(self, module_name: str, module: "BaseLayerWithControlVector"):
@@ -64,14 +67,14 @@ class ControlVectorModel:
     
     def add_control_vector_request(self, request):
         assert isinstance(request, ControlVectorRequest), "Request must be an instance of ControlVectorRequest"
-        self._registered_control_vectors[request.name] = request.control_vector
+        self._registered_control_vectors[request.name] = request.get_control_vector()
     
     def remove_control_vector_request(self, request_name: str):
         if request_name in self._registered_control_vectors:
             del self._registered_control_vectors[request_name]
 
     def get_control_vector_request(self, request_name):
-        return self._registered_control_vectors.get(request_name)
+        return self._registered_control_vectors.get(request_name, None)
     
     def set_active_control_vector_request(self, request):
         if request.name in self._registered_control_vectors:
@@ -80,9 +83,6 @@ class ControlVectorModel:
         else:
             raise ValueError(f"Control vector request{request.name} not found in registered control vectors.")
     
-   
-    
-
     def reset_control_vector(self):
         for _, module in self.model.named_modules():
             if type(module, MLPWithControlVector):

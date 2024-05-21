@@ -16,10 +16,9 @@ class ControlVectorRequest:
         if not isinstance(self.normalize, bool):
             raise TypeError(f"normalize must be a bool, got {type(self.normalize).__name__}")
 
-
-    def get_control_vector(self, layer_id: int) -> Optional[torch.tensor]:
+    def get_control_vector(self) -> Optional[torch.tensor]:
         if self.control_vector is not None:
-            return self.control_vector.get_vector(layer_id) * self.coefficient
+            return self.control_vector
         else:
             return None
 
