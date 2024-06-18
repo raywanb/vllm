@@ -91,7 +91,6 @@ class ControlVectorModel:
 
     def _load_cv(self, cv_request: ControlVectorRequest):
         try:
-            model = self.model
             self.add_control_vector_adapter(cv_request)
             self.set_active_control_vector(cv_request)
             self.set_control_vector()

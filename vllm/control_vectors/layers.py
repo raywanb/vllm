@@ -27,21 +27,14 @@ class MLPWithControlVector(BaseLayerWithControlVector):
     
     def forward(self, hidden_states, positions):
         hidden_states = self.base_layer.forward(hidden_states, positions)
-        
+
         if self.cv_vector is not None:
             norm_pre = torch.norm(hidden_states, dim=-1, keepdim=True)
 
             control = self.cv_vector.to(hidden_states.device)
 
             if len(control.shape) == 1:
-                control = control.view(1, 1, -1)
-
-            print("before expand", control)
-            control = control.expand(hidden_states.shape[0], -1, -1)
-            print('after expand', control)
-
-            print("hidden shape", hidden_states.shape)
-            print("positions", positions.ndim)
+                control = control.view(1, -1).expand(hidden_states.shape[0], -1)
 
             if positions.ndim == 1:
                 positions = positions.unsqueeze(0)
@@ -53,15 +46,12 @@ class MLPWithControlVector(BaseLayerWithControlVector):
             mask = mask.expand(-1, -1, hidden_states.shape[1])
 
             control = control * mask.squeeze(1)
-
-            print("final control ", control)
             hidden_states += control
 
             if self.normalize:
                 hidden_states = hidden_states * (norm_pre / torch.norm(hidden_states, dim=-1, keepdim=True))
         
         return hidden_states
-
 
 
 
