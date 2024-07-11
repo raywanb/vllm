@@ -736,11 +736,29 @@ class PrefixCachingBlock(Block):
         self._block.append_token_ids(token_ids)
         self._update_num_tokens_total()
 
+        if self.is_full:
+            self._calculate_and_cache_hash()
         # If the content hash is present, then the block can be made immutable.
         # Register ourselves with the allocator, potentially replacing the
         # physical block index.
         if self.content_hash is not None:
             self.block_id = self._allocator.promote_to_immutable_block(self)
+
+    def _calculate_and_cache_hash(self) -> None:
+        if self._cached_content_hash is not None:
+            return  # Hash already calculated
+
+        is_first_block = self._prev_block is None
+        prev_block_hash = None if is_first_block else self._prev_block.content_hash
+
+        if prev_block_hash is None and not is_first_block:
+            return  # Cannot calculate hash yet
+
+        self._cached_content_hash = self.hash_block_tokens(
+            is_first_block,
+            prev_block_hash,
+            self.token_ids
+        )
 
     @property
     def block_id(self) -> Optional[int]:
@@ -774,37 +792,43 @@ class PrefixCachingBlock(Block):
     def prev_block(self) -> Optional[Block]:
         return self._prev_block
 
+    # @property
+    # def content_hash(self) -> Optional[int]:
+    #     """Return the content-based hash of the current block, or None if it is
+    #     not yet defined.
+
+    #     For the content-based hash to be defined, the current block must be
+    #     full.
+    #     """
+    #     # If the hash is already computed, return it.
+    #     if self._cached_content_hash is not None:
+    #         return self._cached_content_hash
+
+    #     # We cannot compute a hash for the current block because it is not full.
+    #     if not self.is_full:
+    #         return None
+
+    #     is_first_block = self._prev_block is None
+    #     prev_block_hash = (
+    #         None if is_first_block else
+    #         self._prev_block.content_hash  # type: ignore
+    #     )
+
+    #     # Previous block exists but does not yet have a hash.
+    #     # Return no hash in this case.
+    #     if prev_block_hash is None and not is_first_block:
+    #         return None
+
+    #     self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
+    #         is_first_block,
+    #         prev_block_hash,
+    #         cur_block_token_ids=self.token_ids)
+    #     return self._cached_content_hash
+    
     @property
     def content_hash(self) -> Optional[int]:
-        """Return the content-based hash of the current block, or None if it is
-        not yet defined.
-
-        For the content-based hash to be defined, the current block must be
-        full.
-        """
-        # If the hash is already computed, return it.
-        if self._cached_content_hash is not None:
-            return self._cached_content_hash
-
-        # We cannot compute a hash for the current block because it is not full.
         if not self.is_full:
             return None
-
-        is_first_block = self._prev_block is None
-        prev_block_hash = (
-            None if is_first_block else
-            self._prev_block.content_hash  # type: ignore
-        )
-
-        # Previous block exists but does not yet have a hash.
-        # Return no hash in this case.
-        if prev_block_hash is None and not is_first_block:
-            return None
-
-        self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
-            is_first_block,
-            prev_block_hash,
-            cur_block_token_ids=self.token_ids)
         return self._cached_content_hash
 
     @staticmethod
@@ -867,6 +891,7 @@ class ComputedBlocksTracker:
         assert seq_id in self._cached_computed_seq_blocks
         del self._cached_computed_seq_blocks[seq_id]
 
+    ##TODO: can be further optimized?
     def get_cached_computed_blocks_and_update(
             self, seq_id: int, block_ids: List[int]) -> List[int]:
         """ Look at the class documentation for details
