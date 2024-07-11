@@ -1,8 +1,8 @@
 """Token blocks."""
 
 from os.path import commonprefix
-from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple
-
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple, Set
+import bitarray
 from vllm.core.block.common import (CopyOnWriteTracker,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import Block, BlockAllocator, BlockId, Device
@@ -17,7 +17,6 @@ PrefixHash = int
 # so that if we find one block is still hold _DEFAULT_LAST_ACCESSED_TIME,
 # then we know this block hasn't been accessed yet.
 _DEFAULT_LAST_ACCESSED_TIME = -1
-
 
 class BlockTracker:
     """Used to track the status of a block inside the prefix caching allocator
@@ -41,7 +40,6 @@ class BlockTracker:
         assert self.active
         self.active = False
         self.reset()
-
 
 class PrefixCachingBlockAllocator(BlockAllocator):
     """A block allocator that implements prefix caching.
@@ -106,6 +104,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         self._cow_tracker = CopyOnWriteTracker(
             refcounter=self._refcounter.as_readonly())
+
+        self._computed_blocks = set()
+        self._last_consecutive_computed = -1
 
     # Implements Block.Factory.
     def _create_block(
@@ -509,6 +510,11 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         self._block_tracker[block_id].enable()
         self._block_tracker[block_id].computed = computed
 
+        if computed:
+            self._computed_blocks.add(block_id)
+            if block_id == self._last_consecutive_computed + 1:
+                self._last_consecutive_computed = block_id
+
     def _untrack_block_id(self, block_id: Optional[BlockId]) -> None:
         assert block_id is not None
         self._block_tracker[block_id].disable()
@@ -519,25 +525,36 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         else:
             return block_id in self.evictor
 
-    def get_computed_block_ids(self,
-                               prev_computed_block_ids: List[int],
-                               block_ids: List[int],
-                               skip_last_block_id: bool = True) -> List[int]:
-        prev_prefix_size = len(prev_computed_block_ids)
-        cur_size = len(block_ids)
+    # def get_computed_block_ids(self,
+    #                            prev_computed_block_ids: List[int],
+    #                            block_ids: List[int],
+    #                            skip_last_block_id: bool = True) -> List[int]:
+    #     prev_prefix_size = len(prev_computed_block_ids)
+    #     cur_size = len(block_ids)
+    #     if skip_last_block_id:
+    #         cur_size -= 1
+
+    #     # Sanity checks
+    #     assert cur_size >= 0
+    #     assert prev_prefix_size <= cur_size
+
+    #     ret = prev_computed_block_ids
+    #     for i in range(prev_prefix_size, cur_size):
+    #         block_id = block_ids[i]
+    #         if self.block_is_computed(block_id):
+    #             ret.append(block_id)
+    #     return ret
+
+    def get_computed_block_ids(self, block_ids: List[int], skip_last_block_id: bool = True) -> List[int]:
         if skip_last_block_id:
-            cur_size -= 1
-
-        # Sanity checks
-        assert cur_size >= 0
-        assert prev_prefix_size <= cur_size
-
-        ret = prev_computed_block_ids
-        for i in range(prev_prefix_size, cur_size):
-            block_id = block_ids[i]
-            if self.block_is_computed(block_id):
-                ret.append(block_id)
-        return ret
+            block_ids = block_ids[:-1]
+    
+        # Fast path for consecutive computed blocks
+        if all(id <= self._last_consecutive_computed for id in block_ids):
+            return block_ids
+    
+        # Fall back to set lookup for non-consecutive blocks
+        return [id for id in block_ids if id in self._computed_blocks]
 
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
@@ -736,29 +753,11 @@ class PrefixCachingBlock(Block):
         self._block.append_token_ids(token_ids)
         self._update_num_tokens_total()
 
-        if self.is_full:
-            self._calculate_and_cache_hash()
         # If the content hash is present, then the block can be made immutable.
         # Register ourselves with the allocator, potentially replacing the
         # physical block index.
         if self.content_hash is not None:
             self.block_id = self._allocator.promote_to_immutable_block(self)
-
-    def _calculate_and_cache_hash(self) -> None:
-        if self._cached_content_hash is not None:
-            return  # Hash already calculated
-
-        is_first_block = self._prev_block is None
-        prev_block_hash = None if is_first_block else self._prev_block.content_hash
-
-        if prev_block_hash is None and not is_first_block:
-            return  # Cannot calculate hash yet
-
-        self._cached_content_hash = self.hash_block_tokens(
-            is_first_block,
-            prev_block_hash,
-            self.token_ids
-        )
 
     @property
     def block_id(self) -> Optional[int]:
@@ -792,44 +791,39 @@ class PrefixCachingBlock(Block):
     def prev_block(self) -> Optional[Block]:
         return self._prev_block
 
-    # @property
-    # def content_hash(self) -> Optional[int]:
-    #     """Return the content-based hash of the current block, or None if it is
-    #     not yet defined.
-
-    #     For the content-based hash to be defined, the current block must be
-    #     full.
-    #     """
-    #     # If the hash is already computed, return it.
-    #     if self._cached_content_hash is not None:
-    #         return self._cached_content_hash
-
-    #     # We cannot compute a hash for the current block because it is not full.
-    #     if not self.is_full:
-    #         return None
-
-    #     is_first_block = self._prev_block is None
-    #     prev_block_hash = (
-    #         None if is_first_block else
-    #         self._prev_block.content_hash  # type: ignore
-    #     )
-
-    #     # Previous block exists but does not yet have a hash.
-    #     # Return no hash in this case.
-    #     if prev_block_hash is None and not is_first_block:
-    #         return None
-
-    #     self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
-    #         is_first_block,
-    #         prev_block_hash,
-    #         cur_block_token_ids=self.token_ids)
-    #     return self._cached_content_hash
-    
     @property
     def content_hash(self) -> Optional[int]:
+        """Return the content-based hash of the current block, or None if it is
+        not yet defined.
+
+        For the content-based hash to be defined, the current block must be
+        full.
+        """
+        # If the hash is already computed, return it.
+        if self._cached_content_hash is not None:
+            return self._cached_content_hash
+
+        # We cannot compute a hash for the current block because it is not full.
         if not self.is_full:
             return None
+
+        is_first_block = self._prev_block is None
+        prev_block_hash = (
+            None if is_first_block else
+            self._prev_block.content_hash  # type: ignore
+        )
+
+        # Previous block exists but does not yet have a hash.
+        # Return no hash in this case.
+        if prev_block_hash is None and not is_first_block:
+            return None
+
+        self._cached_content_hash = PrefixCachingBlock.hash_block_tokens(
+            is_first_block,
+            prev_block_hash,
+            cur_block_token_ids=self.token_ids)
         return self._cached_content_hash
+    
 
     @staticmethod
     def hash_block_tokens(is_first_block: bool, prev_block_hash: Optional[int],
@@ -923,7 +917,7 @@ class ComputedBlocksTracker:
 
         # Incremental init for seq_id => Look only at the new blocks
         computed_block_ids = self._allocator.get_computed_block_ids(  # noqa: E501
-            prev_computed_block_ids,
+            # prev_computed_block_ids,
             block_ids,
             skip_last_block_id=
             True,  # We skip last block id to avoid caching of full seq
