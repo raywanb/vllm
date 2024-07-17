@@ -2,7 +2,7 @@
 
 from os.path import commonprefix
 from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple, Set
-import bitarray
+import hashlib
 from vllm.core.block.common import (CopyOnWriteTracker,
                                     get_all_blocks_recursively)
 from vllm.core.block.interfaces import Block, BlockAllocator, BlockId, Device
@@ -261,17 +261,42 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # itself (will be handled by the caller)
         self._hashless_allocator.free(block, keep_block_object=True)
 
+    # def _allocate_block_id(self) -> BlockId:
+    #     """First tries to allocate a block id from the hashless allocator,
+    #     and if there are no blocks, then tries to evict an unused cached block.
+    #     """
+    #     hashless_block_id = self._maybe_allocate_hashless_block_id()
+    #     if hashless_block_id is not None:
+    #         return hashless_block_id
+
+    #     evicted_block_id = self._maybe_allocate_evicted_block_id()
+    #     if evicted_block_id is not None:
+    #         return evicted_block_id
+
+    #     # No block available in hashless allocator, nor in unused cache blocks.
+    #     raise BlockAllocator.NoFreeBlocksError()
+
     def _allocate_block_id(self) -> BlockId:
         """First tries to allocate a block id from the hashless allocator,
         and if there are no blocks, then tries to evict an unused cached block.
         """
-        hashless_block_id = self._maybe_allocate_hashless_block_id()
-        if hashless_block_id is not None:
-            return hashless_block_id
+        # Try to get a block from the hashless allocator
+        try:
+            block = self._hashless_allocator.allocate_mutable_block(prev_block=None)
+            block_id = block.block_id
+            self._block_pool.free_block(block)
+            self._track_block_id(block_id, computed=False)
+            return block_id
+        except BlockAllocator.NoFreeBlocksError:
+            pass
 
-        evicted_block_id = self._maybe_allocate_evicted_block_id()
-        if evicted_block_id is not None:
-            return evicted_block_id
+        # Try to evict a block if there are no free blocks
+        if self.evictor.num_blocks > 0:
+            block_id, content_hash_to_evict = self.evictor.evict()
+            self._cached_blocks.pop(content_hash_to_evict)
+            self._refcounter.incr(block_id)
+            self._track_block_id(block_id, computed=False)
+            return block_id
 
         # No block available in hashless allocator, nor in unused cache blocks.
         raise BlockAllocator.NoFreeBlocksError()
@@ -545,15 +570,26 @@ class PrefixCachingBlockAllocator(BlockAllocator):
     #             ret.append(block_id)
     #     return ret
 
+    # def get_computed_block_ids(self, block_ids: List[int], skip_last_block_id: bool = True) -> List[int]:
+    #     if skip_last_block_id:
+    #         block_ids = block_ids[:-1]
+    
+    #     # Fast path for consecutive computed blocks
+    #     if all(id <= self._last_consecutive_computed for id in block_ids):
+    #         return block_ids
+    
+    #     # Fall back to set lookup for non-consecutive blocks
+    #     return [id for id in block_ids if id in self._computed_blocks]
+
     def get_computed_block_ids(self, block_ids: List[int], skip_last_block_id: bool = True) -> List[int]:
         if skip_last_block_id:
             block_ids = block_ids[:-1]
-    
+        
         # Fast path for consecutive computed blocks
-        if all(id <= self._last_consecutive_computed for id in block_ids):
+        if block_ids and block_ids[-1] <= self._last_consecutive_computed:
             return block_ids
-    
-        # Fall back to set lookup for non-consecutive blocks
+        
+        # Use a list comprehension with a set lookup
         return [id for id in block_ids if id in self._computed_blocks]
 
     def get_common_computed_block_ids(
@@ -569,10 +605,28 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # runner.
 
         # It returns a list of int although type annotation says list of string.
-        return commonprefix([
-            ids for ids in computed_seq_block_ids  # type: ignore
-            if ids != []
-        ])
+        if not computed_seq_block_ids:
+            return []
+
+        # Use the first sequence as a starting point
+        common_prefix = computed_seq_block_ids[0]
+
+        for seq_blocks in computed_seq_block_ids[1:]:
+            # Find the common prefix length
+            common_len = 0
+            for a, b in zip(common_prefix, seq_blocks):
+                if a != b:
+                    break
+                common_len += 1
+
+            # Truncate common_prefix to the common length
+            common_prefix = common_prefix[:common_len]
+
+            # Early exit if no common prefix
+            if not common_prefix:
+                return []
+
+        return common_prefix
 
     def get_num_blocks_touched(self,
                                blocks: List[Block],

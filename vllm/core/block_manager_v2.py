@@ -293,28 +293,51 @@ class BlockSpaceManagerV2(BlockSpaceManager):
         # So this function is useless for block_v2.
         pass
 
+    # def get_common_computed_block_ids(
+    #         self, seqs: List[Sequence]) -> GenericSequence[int]:
+    #     """Determine which blocks for which we skip prefill.
+
+    #     With prefix caching we can skip prefill for previously-generated blocks.
+    #     Currently, the attention implementation only supports skipping cached
+    #     blocks if they are a contiguous prefix of cached blocks.
+
+    #     This method determines which blocks can be safely skipped for all
+    #     sequences in the sequence group.
+    #     """
+    #     computed_seq_block_ids = []
+    #     for seq in seqs:
+    #         computed_seq_block_ids.append(
+    #             self._computed_blocks_tracker.
+    #             get_cached_computed_blocks_and_update(
+    #                 seq.seq_id,
+    #                 self.block_tables[seq.seq_id].physical_block_ids))
+
+    #     # NOTE(sang): This assumes seq_block_ids doesn't contain any None.
+    #     return self.block_allocator.get_common_computed_block_ids(
+    #         computed_seq_block_ids)  # type: ignore
     def get_common_computed_block_ids(
-            self, seqs: List[Sequence]) -> GenericSequence[int]:
-        """Determine which blocks for which we skip prefill.
-
-        With prefix caching we can skip prefill for previously-generated blocks.
-        Currently, the attention implementation only supports skipping cached
-        blocks if they are a contiguous prefix of cached blocks.
-
-        This method determines which blocks can be safely skipped for all
-        sequences in the sequence group.
-        """
-        computed_seq_block_ids = []
-        for seq in seqs:
-            computed_seq_block_ids.append(
-                self._computed_blocks_tracker.
+        self, seqs: List[Sequence]) -> GenericSequence[int]:
+        if not seqs:
+            return []
+        
+        # Get the first sequence's computed blocks
+        common_blocks = set(self._computed_blocks_tracker.
+            get_cached_computed_blocks_and_update(
+                seqs[0].seq_id,
+                self.block_tables[seqs[0].seq_id].physical_block_ids))
+        
+        # Intersect with the rest of the sequences
+        for seq in seqs[1:]:
+            seq_blocks = set(self._computed_blocks_tracker.
                 get_cached_computed_blocks_and_update(
                     seq.seq_id,
                     self.block_tables[seq.seq_id].physical_block_ids))
-
-        # NOTE(sang): This assumes seq_block_ids doesn't contain any None.
-        return self.block_allocator.get_common_computed_block_ids(
-            computed_seq_block_ids)  # type: ignore
+            common_blocks.intersection_update(seq_blocks)
+            
+            if not common_blocks:  # Early exit if no common blocks
+                return []
+        
+        return sorted(common_blocks)
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         if parent_seq.seq_id not in self.block_tables:
