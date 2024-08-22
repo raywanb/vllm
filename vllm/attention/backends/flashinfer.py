@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type
 try:
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-
+    from flashinfer.cascade import (BatchPrefillWithSharedPrefixPagedKVCacheWrapper, BatchDecodeWithSharedPrefixPagedKVCacheWrapper)
     import vllm.attention.backends.flash_attn  # noqa
 except ImportError:
     BatchDecodeWithPagedKVCacheWrapper = None
@@ -85,6 +85,8 @@ class FlashInferMetadata(AttentionMetadata):
 
     prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
     decode_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
+    prefill_shared_wrapper: Optional[BatchPrefillWithSharedPrefixPagedKVCacheWrapper] = None
+    decode_shared_wrapper: Optional[BatchDecodeWithSharedPrefixPagedKVCacheWrapper] = None
 
     # Metadata for the prefill stage
     seq_start_loc: Optional[torch.Tensor] = None
@@ -155,6 +157,16 @@ class FlashInferMetadata(AttentionMetadata):
                     self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
+                
+                unique_paged_kv_indices = self.paged_kv_indices[37:] - 37
+                unique_paged_kv_indptr = torch.tensor([0, self.paged_kv_indptr[1] - 37], device='cuda:0', dtype=torch.int32)
+                unique_paged_kv_last_page_len = self.paged_kv_last_page_len
+                self.prefill_shared_wrapper.end_forward()
+                self.prefill_shared_wrapper.begin_forward(
+                    self.query_start_loc, self.paged_kv_indptr,
+                    self.paged_kv_indices, unique_paged_kv_last_page_len,
+                    self.num_qo_heads, self.num_kv_heads, self.head_dim,
+                    self.page_size)
         else:
             if not self.use_cuda_graph:
                 assert self.paged_kv_indices is not None
@@ -178,6 +190,19 @@ class FlashInferMetadata(AttentionMetadata):
                 # Disable flashinfer's pos encoding and use vllm's rope.
                 pos_encoding_mode="NONE",
                 data_type=self.data_type)
+            if self.decode_shared_wrapper is not None:
+                self.decode_shared_wrapper.end_forward()
+                self.decode_shared_wrapper.begin_forward(
+                    self.paged_kv_indptr,
+                    self.paged_kv_indices,
+                    self.paged_kv_last_page_len,
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.page_size,
+                    # Disable flashinfer's pos encoding and use vllm's rope.
+                    data_type=self.data_type
+                )
 
     def asdict_zerocopy(self,
                         skip_fields: Optional[Set[str]] = None
@@ -283,8 +308,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
+            shared_prefix_len = 0
             if inter_data.prefix_cache_hit:
                 block_table = computed_block_nums
+                shared_prefix_len = len(computed_block_nums) * 16
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 block_table = block_tables[seq_id][-curr_sliding_window_block:]
@@ -308,7 +335,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 return
 
             block_table = block_tables[seq_id]
+            # self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
+            # if is_prompt:
+            #     self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
+            # else:
             self._update_paged_kv_tensors(block_table, seq_len)
+
+    def _update_shared_paged_kv_tensors(self, block_table: List[int], seq_len: int, shared_prefix_len: int):
+        # Calculate the number of blocks in the shared prefix
+        shared_prefix_blocks = shared_prefix_len // self.block_size
+        if shared_prefix_len % self.block_size != 0:
+            shared_prefix_blocks += 1
+
+        # Calculate the sequence length after the shared prefix
+        unique_seq_len = max(0, seq_len - shared_prefix_len)
+
+        # Calculate the number of valid blocks for the unique part
+        unique_block_table_bound = unique_seq_len // self.block_size
+        if unique_seq_len % self.block_size != 0:
+            unique_block_table_bound += 1
+
+        # Extend paged_kv_indices with the unique part of the block table
+        self.paged_kv_indices.extend([block - shared_prefix_blocks for block in block_table[shared_prefix_blocks: shared_prefix_blocks+unique_block_table_bound]])
+
+        # Update paged_kv_indptr
+        self.paged_kv_indptr.append(self.paged_kv_indptr[-1] + unique_block_table_bound)
+
+        # Calculate last_page_len for the unique part
+        if unique_seq_len > 0:
+            last_page_len = unique_seq_len % self.block_size
+            if last_page_len == 0:
+                last_page_len = self.block_size
+        else:
+            last_page_len = 0
+
+        self.paged_kv_last_page_len.append(last_page_len)
 
     def _update_paged_kv_tensors(self, block_table: List[int], seq_len: int):
         # Get the number of valid blocks based on sequence length.
@@ -316,6 +377,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # block_table_bound is 1 with 1 valid block.
         # If seq_len = 15, block_size = 16,
         # block_table_bound is 0 + 1 with 1 valid block.
+        
         block_table_bound = seq_len // self.block_size + 1 \
                             if seq_len % self.block_size != 0 \
                             else seq_len // self.block_size
@@ -499,6 +561,7 @@ class FlashInferImpl(AttentionImpl):
             assert attn_metadata.num_prefill_tokens == 0, (
                 "Chunked prefill is not supported with flashinfer yet.")
 
+        # print("HERE ", attn_metadata.block_tables.shape)
         if kv_cache is not None:
             # Use the same reshape and cache kernel as flash attention.
             ops.reshape_and_cache_flash(
@@ -511,14 +574,45 @@ class FlashInferImpl(AttentionImpl):
                 k_scale,
                 v_scale,
             )
-
         query = query.contiguous(
         )  # Flashinfer requires query to be contiguous
+        # if prefill_meta := attn_metadata.prefill_metadata:
+        #     print("PREFILL?")
+        #     shared_kv_cache = kv_cache[:37, ...]
+        #     unique_kv_cache = kv_cache[37:, ...]
+        #     shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
+
+        #     output = attn_metadata.prefill_shared_wrapper.forward(
+        #         query,
+        #         shared_kv_cache_reshaped[:, 0],  # Key tensor: [37*16, 8, 128]
+        #         shared_kv_cache_reshaped[:, 1],  # Value tensor: [37*16, 8, 128]
+        #         unique_kv_cache,
+        #         causal=True,
+        #         sm_scale=self.scale
+        #     )
+        #     return output.view(num_tokens, hidden_size)
+        # else:
+        #     print("DECODE bro ")
+        #     shared_kv_cache = kv_cache[:37, ...]
+        #     unique_kv_cache = kv_cache[37:, ...]
+        #     shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
+
+        #     output = attn_metadata.decode_shared_wrapper.forward(
+        #         query, 
+        #         shared_kv_cache_reshaped[:, 0],  # Key tensor: [37*16, 8, 128]
+        #         shared_kv_cache_reshaped[:, 1],  # Value tensor: [37*16, 8, 128]
+        #         unique_kv_cache,
+        #         sm_scale=self.scale
+        #     )
+        #     return output.view(num_tokens, hidden_size)
+
+
         if prefill_meta := attn_metadata.prefill_metadata:
             # We will use flash attention for prefill
             # when kv_cache is not provided.
             # This happens when vllm runs the profiling to
             # determine the number of blocks.
+            print("PREFILL ORIGINAL")
             if kv_cache is None:
                 output = torch.ops.vllm.flash_attn_varlen_func(
                     q=query,
@@ -542,6 +636,7 @@ class FlashInferImpl(AttentionImpl):
                     logits_soft_cap=self.logits_soft_cap,
                     causal=True)
         else:
+            print("DECODE ORIGINAL")
             assert attn_metadata.decode_metadata is not None
             assert attn_metadata.decode_metadata.decode_wrapper is not None
             output = attn_metadata.decode_metadata.decode_wrapper.forward(

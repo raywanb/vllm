@@ -17,6 +17,7 @@ try:
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.decode import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+    from flashinfer.cascade import BatchPrefillWithSharedPrefixPagedKVCacheWrapper, BatchDecodeWithSharedPrefixPagedKVCacheWrapper
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 except ImportError:
     BatchDecodeWithPagedKVCacheWrapper = None
@@ -876,6 +877,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.flashinfer_decode_wrapper = None
         self.flashinfer_prefill_workspace_buffer = None
         self.flashinfer_prefill_wrapper = None
+        self.flashinfer_prefill_shared_workspace_buffer = None
+        self.flashinfer_prefill_shared_wrapper = None
+        self.flashinfer_decode_shared_workspace_buffer = None
+        self.flashinfer_decode_shared_wrapper = None
 
         set_cpu_offload_max_bytes(
             int(self.cache_config.cpu_offload_gb * 1024**3))
@@ -1494,9 +1499,29 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 self.flashinfer_prefill_wrapper = \
                     BatchPrefillWithPagedKVCacheWrapper(
                     self.flashinfer_prefill_workspace_buffer, "NHD")
+                self.flashinfer_prefill_shared_workspace_buffer = torch.empty(
+                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                    dtype=torch.uint8,
+                    device=self.device
+                )
+                self.flashinfer_prefill_shared_wrapper = \
+                    BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
+                        self.flashinfer_prefill_shared_workspace_buffer, "NHD")
+                self.flashinfer_decode_shared_workspace_buffer = torch.empty(
+                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                    dtype=torch.uint8,
+                    device=self.device
+                )
+                self.flashinfer_decode_shared_wrapper = \
+                    BatchDecodeWithSharedPrefixPagedKVCacheWrapper(
+                        self.flashinfer_decode_shared_workspace_buffer, "NHD"
+                    )
+                
 
             model_input.attn_metadata.prefill_wrapper = \
                 self.flashinfer_prefill_wrapper
+            model_input.attn_metadata.prefill_shared_wrapper = self.flashinfer_prefill_shared_wrapper
+            model_input.attn_metadata.decode_shared_wrapper = self.flashinfer_decode_shared_wrapper
             if model_input.attn_metadata.use_cuda_graph:
                 batch_size = model_input.input_tokens.shape[0]
                 model_input.attn_metadata.decode_wrapper = self.graph_runners[
