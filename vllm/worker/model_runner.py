@@ -1508,7 +1508,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
                         self.flashinfer_prefill_shared_workspace_buffer, "NHD")
                 self.flashinfer_decode_shared_workspace_buffer = torch.empty(
-                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                    1024 * 1024 * 1024,
                     dtype=torch.uint8,
                     device=self.device
                 )

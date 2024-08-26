@@ -147,6 +147,10 @@ class FlashInferMetadata(AttentionMetadata):
             # determine the number of blocks. Therefore,
             # we don't need to prepare the input for flashinfer for profile run.
             if not self.is_profile_run:
+                # print("FORWARD")
+                # print("PREFILL META INDICES", self.paged_kv_indices)
+                # print("PREFILL META INDPTR", self.paged_kv_indptr)
+                # print("PREFILL META PG LAST LEN", self.paged_kv_last_page_len)
                 self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
                 self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                     self.device)
@@ -158,9 +162,8 @@ class FlashInferMetadata(AttentionMetadata):
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
                 
-                unique_paged_kv_indices = self.paged_kv_indices[37:] - 37
-                unique_paged_kv_indptr = torch.tensor([0, self.paged_kv_indptr[1] - 37], device='cuda:0', dtype=torch.int32)
                 unique_paged_kv_last_page_len = self.paged_kv_last_page_len
+
                 self.prefill_shared_wrapper.end_forward()
                 self.prefill_shared_wrapper.begin_forward(
                     self.query_start_loc, self.paged_kv_indptr,
@@ -176,7 +179,9 @@ class FlashInferMetadata(AttentionMetadata):
                 self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
                 self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                     self.device)
-
+            # print("DECODE META INDICES", self.paged_kv_indices)
+            # print("DECODE META INDPTR", self.paged_kv_indptr)
+            # print("DECODE META PG LAST LEN", self.paged_kv_last_page_len)
             assert self.decode_wrapper is not None
             self.decode_wrapper.end_forward()
             self.decode_wrapper.begin_forward(
@@ -284,13 +289,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         is_prompt = inter_data.is_prompt
         block_tables = inter_data.block_tables
         computed_block_nums = inter_data.computed_block_nums
-
         for (seq_id, token_len, seq_len, curr_seq_len, query_len, context_len,
              curr_sliding_window_block) in zip(
                  inter_data.seq_ids, [len(t) for t in inter_data.input_tokens],
                  inter_data.orig_seq_lens, inter_data.seq_lens,
                  inter_data.query_lens, inter_data.context_lens,
                  inter_data.curr_sliding_window_blocks):
+            # if seq_id == 1:
+            #     context_len = 384
             self.context_lens.append(context_len)
             if is_prompt:
                 self.num_prefills += 1
@@ -315,6 +321,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             elif ((chunked_prefill_enabled or not is_prompt)
                   and block_tables is not None):
                 block_table = block_tables[seq_id][-curr_sliding_window_block:]
+            # else:
+            #     block_table = [x for x in range(0, 24)]
             self.block_tables.append(block_table)
 
             is_profile_run = is_block_tables_empty(block_tables)
@@ -333,13 +341,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if is_profile_run:
                 self.is_profile_run = is_profile_run
                 return
-
             block_table = block_tables[seq_id]
-            # self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
-            # if is_prompt:
-            #     self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
-            # else:
-            self._update_paged_kv_tensors(block_table, seq_len)
+            shared_prefix_len = 129 * 16
+            # # self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
+            if not is_prompt: 
+                self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)   
+            else:
+                self._update_paged_kv_tensors(block_table, seq_len)
+
+            # self._update_paged_kv_tensors(block_table, seq_len)
 
     def _update_shared_paged_kv_tensors(self, block_table: List[int], seq_len: int, shared_prefix_len: int):
         # Calculate the number of blocks in the shared prefix
@@ -460,7 +470,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                      dim=0,
                      dtype=query_start_loc.dtype,
                      out=query_start_loc[1:])
-
+        
         if len(self.paged_kv_indptr) > 0:
             paged_kv_indices_tensor = torch.tensor(self.paged_kv_indices,
                                                    device="cpu",
@@ -531,6 +541,90 @@ class FlashInferImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
+    def Aforward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: Optional[torch.Tensor],
+        attn_metadata: FlashInferMetadata,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        attn_type: AttentionType = AttentionType.DECODER,
+    ) -> torch.Tensor:
+        assert k_scale == 1.0 and v_scale == 1.0, (
+            "key/v_scale is not supported in FlashInfer.")
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError("Encoder self-attention and "
+                                      "encoder/decoder cross-attention "
+                                      "are not implemented for "
+                                      "FlashInferImpl")
+        num_tokens, hidden_size = query.shape
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+
+        if attn_metadata.num_prefill_tokens > 0:
+            assert attn_metadata.num_decode_tokens == 0, (
+                "Chunked prefill is not supported with flashinfer yet.")
+        if attn_metadata.num_decode_tokens > 0:
+            assert attn_metadata.num_prefill_tokens == 0, (
+                "Chunked prefill is not supported with flashinfer yet.")
+
+        if kv_cache is not None:
+            # Use the same reshape and cache kernel as flash attention.
+            ops.reshape_and_cache_flash(
+                key,
+                value,
+                kv_cache[:, 0],
+                kv_cache[:, 1],
+                attn_metadata.slot_mapping.flatten(),
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+
+        query = query.contiguous(
+        )  # Flashinfer requires query to be contiguous
+
+        if prefill_meta := attn_metadata.prefill_metadata:
+            # We will use flash attention for prefill
+            # when kv_cache is not provided.
+            # This happens when vllm runs the profiling to
+            # determine the number of blocks.
+
+            if kv_cache is None:
+                output = torch.ops.vllm.flash_attn_varlen_func(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=prefill_meta.seq_start_loc,
+                    cu_seqlens_k=prefill_meta.seq_start_loc,
+                    max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                    max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=self.sliding_window,
+                    alibi_slopes=self.alibi_slopes,
+                )
+            else:
+                assert prefill_meta is not None
+                assert prefill_meta.prefill_wrapper is not None
+                output = prefill_meta.prefill_wrapper.forward(
+                    query,
+                    kv_cache,
+                    logits_soft_cap=self.logits_soft_cap,
+                    causal=True)
+        else:
+            assert attn_metadata.decode_metadata is not None
+            assert attn_metadata.decode_metadata.decode_wrapper is not None
+            output = attn_metadata.decode_metadata.decode_wrapper.forward(
+                query,
+                kv_cache,
+                sm_scale=self.scale,
+                logits_soft_cap=self.logits_soft_cap)
+        return output.view(num_tokens, hidden_size)
+    
     def forward(
         self,
         query: torch.Tensor,
@@ -576,72 +670,82 @@ class FlashInferImpl(AttentionImpl):
             )
         query = query.contiguous(
         )  # Flashinfer requires query to be contiguous
-        # if prefill_meta := attn_metadata.prefill_metadata:
-        #     print("PREFILL?")
-        #     shared_kv_cache = kv_cache[:37, ...]
-        #     unique_kv_cache = kv_cache[37:, ...]
-        #     shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
-
-        #     output = attn_metadata.prefill_shared_wrapper.forward(
-        #         query,
-        #         shared_kv_cache_reshaped[:, 0],  # Key tensor: [37*16, 8, 128]
-        #         shared_kv_cache_reshaped[:, 1],  # Value tensor: [37*16, 8, 128]
-        #         unique_kv_cache,
-        #         causal=True,
-        #         sm_scale=self.scale
-        #     )
-        #     return output.view(num_tokens, hidden_size)
-        # else:
-        #     print("DECODE bro ")
-        #     shared_kv_cache = kv_cache[:37, ...]
-        #     unique_kv_cache = kv_cache[37:, ...]
-        #     shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
-
-        #     output = attn_metadata.decode_shared_wrapper.forward(
-        #         query, 
-        #         shared_kv_cache_reshaped[:, 0],  # Key tensor: [37*16, 8, 128]
-        #         shared_kv_cache_reshaped[:, 1],  # Value tensor: [37*16, 8, 128]
-        #         unique_kv_cache,
-        #         sm_scale=self.scale
-        #     )
-        #     return output.view(num_tokens, hidden_size)
-
-
         if prefill_meta := attn_metadata.prefill_metadata:
-            # We will use flash attention for prefill
-            # when kv_cache is not provided.
-            # This happens when vllm runs the profiling to
-            # determine the number of blocks.
-            print("PREFILL ORIGINAL")
-            if kv_cache is None:
-                output = torch.ops.vllm.flash_attn_varlen_func(
-                    q=query,
-                    k=key,
-                    v=value,
-                    cu_seqlens_q=prefill_meta.seq_start_loc,
-                    cu_seqlens_k=prefill_meta.seq_start_loc,
-                    max_seqlen_q=prefill_meta.max_prefill_seq_len,
-                    max_seqlen_k=prefill_meta.max_prefill_seq_len,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    window_size=self.sliding_window,
-                    alibi_slopes=self.alibi_slopes,
-                )
+            if not attn_metadata.block_tables.numel():
+                if kv_cache is None:
+                    # print("FLASH ATTN")
+                    output = torch.ops.vllm.flash_attn_varlen_func(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=prefill_meta.seq_start_loc,
+                        cu_seqlens_k=prefill_meta.seq_start_loc,
+                        max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                        max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                    )
+                else:
+                    # print("PREFILL SHARED")
+                    shared_kv_cache = kv_cache[:24, ...]
+                    unique_kv_cache = kv_cache[24:, ...]
+                    shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
+                    output = attn_metadata.prefill_shared_wrapper.forward(
+                        query,
+                        shared_kv_cache_reshaped[:, 0],  # Key tensor: [37*16, 8, 128]
+                        shared_kv_cache_reshaped[:, 1],  # Value tensor: [37*16, 8, 128]
+                        unique_kv_cache,
+                        causal=True,
+                        sm_scale=self.scale
+                    )
             else:
-                assert prefill_meta is not None
-                assert prefill_meta.prefill_wrapper is not None
-                output = prefill_meta.prefill_wrapper.forward(
-                    query,
-                    kv_cache,
-                    logits_soft_cap=self.logits_soft_cap,
-                    causal=True)
+                if kv_cache is None:
+                    # print("FLASH ATTN")
+                    output = torch.ops.vllm.flash_attn_varlen_func(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=prefill_meta.seq_start_loc,
+                        cu_seqlens_k=prefill_meta.seq_start_loc,
+                        max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                        max_seqlen_k=prefill_meta.max_prefill_seq_len,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                    )
+                else:
+                    # print("PREFILL")
+                    # print("PREFILL SHARED")
+                    # print("LEN", len(attn_metadata.block_tables[0]))
+                    # print("FIRST BLOCK ID", attn_metadata.block_tables)
+                    # print("PREFILL META INDICES", prefill_meta.paged_kv_indices)
+                    # print("PREFILL META INDPTR", prefill_meta.paged_kv_indptr)
+                    # print("PREFILL META PG LAST LEN", prefill_meta.paged_kv_last_page_len)
+                    # print("PREFILL NORMAL")
+                    assert prefill_meta is not None
+                    assert prefill_meta.prefill_wrapper is not None
+                    output = prefill_meta.prefill_wrapper.forward(
+                        query,
+                        kv_cache,
+                        logits_soft_cap=self.logits_soft_cap,
+                        causal=True)
+
         else:
-            print("DECODE ORIGINAL")
-            assert attn_metadata.decode_metadata is not None
-            assert attn_metadata.decode_metadata.decode_wrapper is not None
-            output = attn_metadata.decode_metadata.decode_wrapper.forward(
-                query,
-                kv_cache,
-                sm_scale=self.scale,
-                logits_soft_cap=self.logits_soft_cap)
+            if attn_metadata.decode_metadata.decode_shared_wrapper:
+                # print("DECODE SHARED")
+                shared_kv_cache = kv_cache[:129, ...]
+                unique_kv_cache = kv_cache[129:, ...]
+                shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
+
+                output = attn_metadata.decode_metadata.decode_shared_wrapper.forward(
+                    query,
+                    shared_kv_cache_reshaped[:, 0],
+                    shared_kv_cache_reshaped[:, 1],
+                    unique_kv_cache,
+                    sm_scale=self.scale,
+                )
+    
         return output.view(num_tokens, hidden_size)
