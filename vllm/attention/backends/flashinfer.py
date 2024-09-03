@@ -149,10 +149,6 @@ class FlashInferMetadata(AttentionMetadata):
             # determine the number of blocks. Therefore,
             # we don't need to prepare the input for flashinfer for profile run.
             if not self.is_profile_run:
-                # print("FORWARD")
-                # print("PREFILL META INDICES", self.paged_kv_indices)
-                # print("PREFILL META INDPTR", self.paged_kv_indptr)
-                # print("PREFILL META PG LAST LEN", self.paged_kv_last_page_len)
                 self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
                 self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                     self.device)
@@ -181,9 +177,6 @@ class FlashInferMetadata(AttentionMetadata):
                 self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
                 self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                     self.device)
-            # print("DECODE META INDICES", self.paged_kv_indices)
-            # print("DECODE META INDPTR", self.paged_kv_indptr)
-            # print("DECODE META PG LAST LEN", self.paged_kv_last_page_len)
             assert self.decode_wrapper is not None
             self.decode_wrapper.end_forward()
             self.decode_wrapper.begin_forward(
