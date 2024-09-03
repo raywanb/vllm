@@ -657,7 +657,6 @@ class FlashAttentionImpl(AttentionImpl):
         assert decode_query.shape[0] == num_decode_tokens
 
         if prefill_meta := attn_metadata.prefill_metadata:
-            print("PREFILL")
             # Prompt run.
             if (kv_cache is None or prefill_meta.block_tables is None
                     or prefill_meta.block_tables.numel() == 0):
@@ -702,7 +701,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         if decode_meta := attn_metadata.decode_metadata:
             # Decoding run.
-            print("DECODE")
             output[
                 num_prefill_tokens:] = torch.ops.vllm.flash_attn_with_kvcache(
                     decode_query.unsqueeze(1),
