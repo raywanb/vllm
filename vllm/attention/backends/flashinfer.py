@@ -159,13 +159,11 @@ class FlashInferMetadata(AttentionMetadata):
                     self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
-                
-                unique_paged_kv_last_page_len = self.paged_kv_last_page_len
 
                 self.prefill_shared_wrapper.end_forward()
                 self.prefill_shared_wrapper.begin_forward(
                     self.query_start_loc, self.paged_kv_indptr,
-                    self.paged_kv_indices, unique_paged_kv_last_page_len,
+                    self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
         else:
