@@ -504,7 +504,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             data_type=kv_cache_dtype,
             use_cuda_graph=use_captured_graph,
             is_profile_run=self.is_profile_run,
-            shared_blocks=53)
+            shared_blocks=shared_blocks)
 
 
 class FlashInferImpl(AttentionImpl):
