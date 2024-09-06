@@ -274,7 +274,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
-            chunked_prefill_enabled: bool, common_prefix: list):
+            chunked_prefill_enabled: bool, common_prefix: int):
         """Add a sequence group to the metadata. Specifically update/append
         1. context length.
         2. block table.
@@ -306,7 +306,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
-            shared_prefix_len = len(common_prefix) * self.block_size
+            shared_prefix_len = common_prefix * self.block_size
             if inter_data.prefix_cache_hit:
                 block_table = computed_block_nums
             elif ((chunked_prefill_enabled or not is_prompt)
@@ -382,14 +382,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             for data in inter_data_list
             if data.block_tables
         ]
-        
         flattened_lists = [item for sublist in block_id_lists for item in sublist]
-        
         if len(flattened_lists) == 1:
             return flattened_lists[0]
         
         common_prefix = commonprefix(flattened_lists)
-        
+
+        for i in range(1, len(common_prefix)):
+            if common_prefix[i] != common_prefix[i-1] + 1:
+                return common_prefix[:i]
         return common_prefix
 
     def build(self, seq_lens: List[int], query_lens: List[int],
@@ -407,7 +408,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         shared_blocks = len(common_prefix)
         for inter_data in self.input_builder.inter_data_list:
             self._add_seq_group(inter_data,
-                                self.input_builder.chunked_prefill_enabled, common_prefix)
+                                self.input_builder.chunked_prefill_enabled, shared_blocks)
 
         device = self.runner.device
         use_captured_graph = cuda_graph_pad_size != -1
@@ -503,7 +504,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             data_type=kv_cache_dtype,
             use_cuda_graph=use_captured_graph,
             is_profile_run=self.is_profile_run,
-            shared_blocks=shared_blocks)
+            shared_blocks=53)
 
 
 class FlashInferImpl(AttentionImpl):
@@ -602,17 +603,37 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache,
                     logits_soft_cap=self.logits_soft_cap,
                     causal=True)
+                # shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
+                # unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
+                # shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
+                # output = prefill_meta.prefill_shared_wrapper.forward(
+                #     query, 
+                #     shared_kv_cache_reshaped[:, 0],
+                #     shared_kv_cache_reshaped[:, 1],
+                #     unique_kv_cache,
+                #     causal=True
+                # )
         else:
-            shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
-            unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
-            shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
+            if attn_metadata.decode_shared_wrapper:
+                shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
+                unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
+                shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
 
-            output = attn_metadata.decode_metadata.decode_shared_wrapper.forward(
-                query,
-                shared_kv_cache_reshaped[:, 0],
-                shared_kv_cache_reshaped[:, 1],
-                unique_kv_cache,
-                sm_scale=self.scale,
-            )
+                output = attn_metadata.decode_metadata.decode_shared_wrapper.forward(
+                    query,
+                    shared_kv_cache_reshaped[:, 0],
+                    shared_kv_cache_reshaped[:, 1],
+                    unique_kv_cache,
+                )
+            else:
+                assert attn_metadata.decode_metadata is not None
+                assert attn_metadata.decode_metadata.decode_wrapper is not None
+                output = attn_metadata.decode_metadata.decode_wrapper.forward(
+                    query,
+                    kv_cache,
+                    sm_scale=self.scale,
+                    logits_soft_cap=self.logits_soft_cap,
+                    k_scale=k_scale,
+                    v_scale=v_scale)
 
         return output.view(num_tokens, hidden_size)

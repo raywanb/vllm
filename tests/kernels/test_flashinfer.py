@@ -150,7 +150,7 @@ def test_flashinfer_decode_with_paged_kv(kv_lens: List[int],
         f"{torch.max(torch.abs(output - ref_output))}"
 
 
-@pytest.mark.parametrize("seq_lens", [[(16484, 16484), (16484, 16484)]])
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
@@ -231,6 +231,97 @@ def test_flashinfer_prefill_with_paged_kv(seq_lens: List[Tuple[int, int]],
         head_size,
         block_size,
     )
+
+    output = wrapper.forward(
+        query,
+        key_value_cache,
+        logits_soft_cap=soft_cap,
+    )
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache,
+                                value_cache=value_cache,
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                soft_cap=soft_cap)
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+
+@torch.inference_mode
+def test_flashinfer_prefill_unshared(seq_lens: List[Tuple[int, int]],
+                                          num_heads: Tuple[int, int],
+                                          head_size: int, dtype: torch.dtype,
+                                          block_size: int,
+                                          soft_cap: Optional[float]) -> None:
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens),
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+    key_value_cache = torch.randn(NUM_BLOCKS,
+                                  2,
+                                  block_size,
+                                  num_kv_heads,
+                                  head_size,
+                                  dtype=dtype)
+    key_cache = key_value_cache[:, 0, :, :, :].squeeze(1)
+    value_cache = key_value_cache[:, 1, :, :, :].squeeze(1)
+
+    # Normalize the scale of the key and value caches to mitigate
+    # numerical instability.
+    key_cache /= head_size**0.5
+    value_cache /= head_size**0.5
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.arange(max_num_blocks_per_seq*num_seqs, dtype=torch.int32).reshape(num_seqs, max_num_blocks_per_seq)
+
+
+    qo_indptr = [0]
+    kv_indptr = [0]
+    kv_indices = []
+    kv_last_page_lens = []
+    for i in range(num_seqs):
+        seq_len = kv_lens[i]
+        assert seq_len > 0
+        num_blocks = (seq_len + block_size - 1) // block_size
+        kv_indices.extend(block_tables[i, :num_blocks])
+        kv_indptr.append(kv_indptr[-1] + num_blocks)
+        kv_last_page_len = seq_len % block_size
+        if kv_last_page_len == 0:
+            kv_last_page_len = block_size
+        kv_last_page_lens.append(kv_last_page_len)
+        qo_indptr.append(qo_indptr[-1] + query_lens[i])
+        
+    qo_indptr = torch.tensor(qo_indptr, dtype=torch.int32)
+    kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
+    kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
+    kv_last_page_lens = torch.tensor(kv_last_page_lens, dtype=torch.int32)
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD")
+    wrapper.begin_forward(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+    )
     torch.cuda.synchronize()
     start_time = time.perf_counter()
     output = wrapper.forward(
@@ -240,26 +331,17 @@ def test_flashinfer_prefill_with_paged_kv(seq_lens: List[Tuple[int, int]],
     )
     torch.cuda.synchronize()
     unshared_time = (time.perf_counter() - start_time) / 10
-    print(unshared_time)
-    ref_output = ref_paged_attn(query=query,
-                                key_cache=key_cache,
-                                value_cache=value_cache,
-                                query_lens=query_lens,
-                                kv_lens=kv_lens,
-                                block_tables=block_tables,
-                                scale=scale,
-                                soft_cap=soft_cap)
-    # torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2), \
-    #     f"{torch.max(torch.abs(output - ref_output))}"
+    # ref_output = ref_paged_attn(query=query,
+    #                             key_cache=key_cache,
+    #                             value_cache=value_cache,
+    #                             query_lens=query_lens,
+    #                             kv_lens=kv_lens,
+    #                             block_tables=block_tables,
+    #                             scale=scale,
+    #                             soft_cap=soft_cap)
     
-    return output
+    return output, unshared_time
 
-@pytest.mark.parametrize("seq_lens", [[(8292, 8292), (8292, 8292), (8292, 8292)]])
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None, 30.0, 50.0])
 @torch.inference_mode
 def test_flashinfer_prefill_shared(
     seq_lens: List[Tuple[int, int]],
@@ -282,14 +364,12 @@ def test_flashinfer_prefill_shared(
     max_kv_len = max(kv_lens)
     scale = head_size ** -0.5
 
-    query = torch.randn(sum(query_lens), num_query_heads, head_size,dtype=dtype)
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
 
-    shared_prefix_len = 8192*4
-    unique_suffix_len = 100
+    shared_prefix_len = 32768
+    unique_suffix_len = max(0, max_kv_len - shared_prefix_len)
     total_seq_len = shared_prefix_len + unique_suffix_len
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-
-   
+    max_num_blocks_per_seq = (total_seq_len + block_size - 1) // block_size
 
     shared_blocks = (shared_prefix_len + block_size - 1) // block_size
     unique_blocks = (unique_suffix_len + block_size - 1) // block_size
@@ -309,39 +389,35 @@ def test_flashinfer_prefill_shared(
     key_cache /= head_size**0.5
     value_cache /= head_size**0.5
 
-   
-
     block_tables = torch.zeros((num_seqs, max_num_blocks_per_seq), dtype=torch.int32)
     for i in range(num_seqs):
         block_tables[i, :shared_blocks] = torch.arange(shared_blocks)
-        block_tables[i, shared_blocks:shared_blocks+unique_blocks] = torch.arange(shared_blocks, shared_blocks + unique_blocks) + i * unique_blocks
+        if unique_blocks > 0:
+            block_tables[i, shared_blocks:shared_blocks+unique_blocks] = torch.arange(shared_blocks, shared_blocks + unique_blocks) + i * unique_blocks
 
     qo_indptr = [0]
     kv_indptr = [0]
     kv_indices = []
     kv_last_page_lens = []
     
-
+    
     for i in range(num_seqs):
-        kv_indices.extend(range(unique_blocks))
+        if unique_blocks > 0:
+            kv_indices.extend(range(unique_blocks))
         kv_indptr.append(kv_indptr[-1] + unique_blocks)
         
         kv_last_page_len = unique_suffix_len % block_size
-        if kv_last_page_len == 0:
+        if kv_last_page_len == 0 and unique_suffix_len > 0:
             kv_last_page_len = block_size
         kv_last_page_lens.append(kv_last_page_len)
         qo_indptr.append(qo_indptr[-1] + query_lens[i])
-
-
-    query_lens = [total_seq_len] * num_seqs
-    kv_lens = [total_seq_len] * num_seqs
 
     qo_indptr = torch.tensor(qo_indptr, dtype=torch.int32)
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
     kv_last_page_lens = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8)
     wrapper = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
         workspace_buffer, "NHD")
     wrapper.begin_forward(
@@ -355,24 +431,9 @@ def test_flashinfer_prefill_shared(
         block_size,
     )
 
-    wrapper = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
-    workspace_buffer, "NHD")
-    wrapper.begin_forward(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        num_query_heads,
-        num_kv_heads,
-        head_size,
-        block_size,
-    )
-
-    # Reshape k_shared and v_shared to be 3D tensors
     k_shared = key_cache[:shared_blocks].reshape(-1, num_kv_heads, head_size)
     v_shared = value_cache[:shared_blocks].reshape(-1, num_kv_heads, head_size)
 
-    # Prepare the unique_kv_cache
     unique_kv_cache = key_value_cache[shared_blocks:]
 
     torch.cuda.synchronize()
@@ -386,28 +447,20 @@ def test_flashinfer_prefill_shared(
     torch.cuda.synchronize()
     shared_time = (time.perf_counter() - start_time) / 10
 
-    print(shared_time)
-
-    return output
-
-
-    
+    return output, shared_time
 
 def run_tests():
-    # Common parameters for both tests
-    seq_lens = [(16484, 16484), (16484, 16484)]
-    num_heads = (32, 32)  # Assuming this is correct based on the NUM_HEADS constant
-    head_size = 128  # Assuming this is one of the HEAD_SIZES
-    block_size = 16  # Assuming this is one of the BLOCK_SIZES
-    dtype = torch.float16  # Assuming this is one of the DTYPES
-    soft_cap = None  # Using None as an example
+    seq_lens = [(2000, 32868), (1000, 32868), (1000, 32868),(2000, 32868), (1000, 32868), (1000, 32868)]
+    num_heads = (32, 32) 
+    head_size = 128 
+    block_size = 16
+    dtype = torch.float16  
+    soft_cap = None
 
-    # Run test_flashinfer_prefill_with_paged_kv
     paged_kv_output = test_flashinfer_prefill_with_paged_kv(
         seq_lens, num_heads, head_size, dtype, block_size, soft_cap
     )
 
-    # Run test_flashinfer_prefill_shared
     shared_output = test_flashinfer_prefill_shared(
         seq_lens, num_heads, head_size, dtype, block_size, soft_cap
     )
@@ -415,14 +468,12 @@ def run_tests():
     return paged_kv_output, shared_output
 
 def compare_outputs(paged_kv_output, shared_output):
-    # Compare the shapes
-    shape_match = paged_kv_output.shape == shared_output.shape
+    shape_match = paged_kv_output[0].shape == shared_output[0].shape
     
-    # Compare the values
     if shape_match:
-        max_diff = torch.max(torch.abs(paged_kv_output - shared_output))
-        mean_diff = torch.mean(torch.abs(paged_kv_output - shared_output))
-        are_close = torch.allclose(paged_kv_output, shared_output, atol=1e-2, rtol=1e-2)
+        max_diff = torch.max(torch.abs(paged_kv_output[0] - shared_output[0]))
+        mean_diff = torch.mean(torch.abs(paged_kv_output[0] - shared_output[0]))
+        are_close = torch.allclose(paged_kv_output[0], shared_output[0], atol=1e-2, rtol=1e-2)
     else:
         max_diff = None
         mean_diff = None
@@ -432,7 +483,8 @@ def compare_outputs(paged_kv_output, shared_output):
         "shape_match": shape_match,
         "max_difference": max_diff,
         "mean_difference": mean_diff,
-        "are_close": are_close
+        "are_close": are_close,
+        "speedup": paged_kv_output[1]/shared_output[1]
     }
 
 if __name__ == "__main__":
@@ -444,3 +496,4 @@ if __name__ == "__main__":
     print(f"Maximum difference: {comparison_results['max_difference']}")
     print(f"Mean difference: {comparison_results['mean_difference']}")
     print(f"Outputs are close (within 1e-2 tolerance): {comparison_results['are_close']}")
+    print(f"Speedup: {comparison_results['speedup']}")
