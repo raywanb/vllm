@@ -335,6 +335,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
             else:
                 self._update_paged_kv_tensors(block_table, seq_len)
+            # self._update_paged_kv_tensors(block_table, seq_len)
 
     def _update_shared_paged_kv_tensors(self, block_table: List[int], seq_len: int, shared_prefix_len: int):
         shared_prefix_blocks = shared_prefix_len // self.block_size
@@ -604,7 +605,7 @@ class FlashInferImpl(AttentionImpl):
         else:
             shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
             unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
-            shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, 8, 128)
+            shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
 
             output = attn_metadata.decode_metadata.decode_shared_wrapper.forward(
                 query,
