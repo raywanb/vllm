@@ -331,14 +331,6 @@ def test_flashinfer_prefill_unshared(seq_lens: List[Tuple[int, int]],
     )
     torch.cuda.synchronize()
     unshared_time = (time.perf_counter() - start_time) / 10
-    # ref_output = ref_paged_attn(query=query,
-    #                             key_cache=key_cache,
-    #                             value_cache=value_cache,
-    #                             query_lens=query_lens,
-    #                             kv_lens=kv_lens,
-    #                             block_tables=block_tables,
-    #                             scale=scale,
-    #                             soft_cap=soft_cap)
     
     return output, unshared_time
 
@@ -366,7 +358,7 @@ def test_flashinfer_prefill_shared(
 
     query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
 
-    shared_prefix_len = 32768
+    shared_prefix_len = 32768 # need to change whenever you change the seq_len
     unique_suffix_len = max(0, max_kv_len - shared_prefix_len)
     total_seq_len = shared_prefix_len + unique_suffix_len
     max_num_blocks_per_seq = (total_seq_len + block_size - 1) // block_size
@@ -400,7 +392,7 @@ def test_flashinfer_prefill_shared(
     kv_indices = []
     kv_last_page_lens = []
     
-    
+    # prefill shared kernel doesn't require the kv_indices to be the unique pages
     for i in range(num_seqs):
         if unique_blocks > 0:
             kv_indices.extend(range(unique_blocks))
@@ -417,7 +409,7 @@ def test_flashinfer_prefill_shared(
     kv_indices = torch.tensor(kv_indices, dtype=torch.int32)
     kv_last_page_lens = torch.tensor(kv_last_page_lens, dtype=torch.int32)
 
-    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
     wrapper = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
         workspace_buffer, "NHD")
     wrapper.begin_forward(
@@ -450,14 +442,14 @@ def test_flashinfer_prefill_shared(
     return output, shared_time
 
 def run_tests():
-    seq_lens = [(2000, 32868), (1000, 32868), (1000, 32868),(2000, 32868), (1000, 32868), (1000, 32868)]
+    seq_lens = [(2000, 32868), (1000, 32868), (1000, 32868)]
     num_heads = (32, 32) 
     head_size = 128 
     block_size = 16
     dtype = torch.float16  
     soft_cap = None
 
-    paged_kv_output = test_flashinfer_prefill_with_paged_kv(
+    paged_kv_output = test_flashinfer_prefill_unshared(
         seq_lens, num_heads, head_size, dtype, block_size, soft_cap
     )
 
@@ -484,7 +476,7 @@ def compare_outputs(paged_kv_output, shared_output):
         "max_difference": max_diff,
         "mean_difference": mean_diff,
         "are_close": are_close,
-        "speedup": paged_kv_output[1]/shared_output[1]
+        "speedup": paged_kv_output[1] / shared_output[1]
     }
 
 if __name__ == "__main__":
