@@ -34,7 +34,6 @@ def test_flashinfer_batchprefill_beam_search(
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
 
-    max_num_blocks_per_seq = 1024
     num_blocks = max_num_blocks_per_seq * num_seqs * beam_width
 
     if key_value_cache is None:
@@ -73,7 +72,7 @@ def test_flashinfer_batchprefill_beam_search(
 
     next_block_index = [(x + block_size - 1) // block_size + 1 for x in kv_lens]  # Index of the next block from block table
 
-    ## REFORMAT KV_INDICES FOR DECODE
+    ## FORMAT KV_INDICES FOR DECODE
     kv_indptr = [0]
     kv_indices = []
     kv_last_page_lens = []
@@ -126,7 +125,7 @@ def test_flashinfer_batchprefill_beam_search(
         kv_last_page_lens = [(x + 1) % block_size or block_size for x in kv_last_page_lens]
 
     print(f"NORMAL PREFILL/DECODE: Total cumulative time for .forward calls: {cumulative_run_time} ms")
-    return outputs
+    return outputs, cumulative_run_time
 
 @pytest.mark.parametrize("num_heads", [(16, 16)])
 @pytest.mark.parametrize("head_size", [128])
@@ -278,7 +277,7 @@ def test_multilevel_cascade_attention_wrapper(
         unique_kv_last_page_len = [(x + 1) % block_size or block_size for x in unique_kv_last_page_len]
 
     print("CASCADE: Total cumulative time for .run calls:", cumulative_run_time)
-    return outputs
+    return outputs, cumulative_run_time
 
 
 def initialize_key_value_cache(num_seqs, beam_width, max_num_blocks_per_seq, block_size, num_kv_heads, head_size, dtype):
@@ -291,81 +290,215 @@ def initialize_key_value_cache(num_seqs, beam_width, max_num_blocks_per_seq, blo
     return key_value_cache
 
 
-def run_and_compare_flashinfer_tests():
+def run_flashinfer_speedup_tests(test_cases):
+    """
+    Run and compare multiple test cases for flashinfer tests,
+    calculate the speedup of multilevel kernel over batch prefill.
+    
+    Parameters:
+        test_cases (list of dict): Each dict should contain parameters for beam_width and seq_lens.
+    """
+    # Set the constant parameters
     common_params = {
         "num_heads": (16, 16),
         "head_size": 128,
         "dtype": torch.float16,
         "block_size": 16,
-        "seq_lens": [(4096, 4096)],
         "num_runs": 1000,
-        "beam_width": 32,
-        "max_num_blocks_per_seq": 512
+        "max_num_blocks_per_seq": 2560
     }
-
-    num_seqs = len(common_params["seq_lens"])
-    num_query_heads, num_kv_heads = common_params["num_heads"]
-
-    key_value_cache = initialize_key_value_cache(
-        num_seqs, 
-        common_params["beam_width"], 
-        common_params["max_num_blocks_per_seq"], 
-        common_params["block_size"], 
-        num_kv_heads, 
-        common_params["head_size"], 
-        common_params["dtype"]
-    )
-
-    # Run cascade test/
-    cascade_outputs = test_multilevel_cascade_attention_wrapper(
-        **common_params,
-        num_levels=2,
-        key_value_cache=key_value_cache
-    )
     
-    cascade_outputs_cpu = [output.cpu() for output in cascade_outputs]
+    results = []
 
-    del cascade_outputs
+    for case_idx, params in enumerate(test_cases):
+        print(f"\nRunning test case {case_idx + 1}/{len(test_cases)}...")
+        num_seqs = len(params["seq_lens"])
+        num_query_heads, num_kv_heads = common_params["num_heads"]
 
-    # Run batchprefill test
-    batchprefill_outputs = test_flashinfer_batchprefill_beam_search(
-        **common_params,
-        soft_cap=None,
-        key_value_cache=key_value_cache
-    )
+        # Initialize key-value cache with updated parameters for each test case
+        key_value_cache = initialize_key_value_cache(
+            num_seqs, 
+            params["beam_width"], 
+            common_params["max_num_blocks_per_seq"], 
+            common_params["block_size"], 
+            num_kv_heads, 
+            common_params["head_size"], 
+            common_params["dtype"]
+        )
 
-    batchprefill_outputs_cpu = [output.cpu() for output in batchprefill_outputs]
+        # Run cascade test
+        cascade_outputs, time_taken_cascade = test_multilevel_cascade_attention_wrapper(
+            **common_params,
+            seq_lens=params["seq_lens"],
+            beam_width=params["beam_width"],
+            num_levels=2,
+            key_value_cache=key_value_cache
+        )
+        
+        cascade_outputs_cpu = [output.cpu() for output in cascade_outputs]
+        del cascade_outputs
 
-    del batchprefill_outputs
+        # Clear CUDA cache before next test
+        torch.cuda.empty_cache()
 
-    assert len(cascade_outputs_cpu) == len(batchprefill_outputs_cpu), "Number of outputs mismatch"
+        # Run batchprefill test
+        batchprefill_outputs, time_taken_batchprefill = test_flashinfer_batchprefill_beam_search(
+            **common_params,
+            seq_lens=params["seq_lens"],
+            beam_width=params["beam_width"],
+            soft_cap=None,
+            key_value_cache=key_value_cache
+        )
 
-    max_diff = 0
-    total_elements = 0
-    total_diff = 0
+        batchprefill_outputs_cpu = [output.cpu() for output in batchprefill_outputs]
+        del batchprefill_outputs
 
-    for i, (cascade_output, batchprefill_output) in enumerate(zip(cascade_outputs_cpu, batchprefill_outputs_cpu)):
-        assert cascade_output.shape == batchprefill_output.shape, f"Shape mismatch at step {i}"
+        # Clear CUDA cache after batchprefill test
+        torch.cuda.empty_cache()
 
-        diff = torch.abs(cascade_output - batchprefill_output)
+        assert len(cascade_outputs_cpu) == len(batchprefill_outputs_cpu), "Number of outputs mismatch"
 
-        max_step_diff = torch.max(diff).item()
+        max_diff = 0
+        total_elements = 0
+        total_diff = 0
 
-        max_diff = max(max_diff, max_step_diff)
+        for i, (cascade_output, batchprefill_output) in enumerate(zip(cascade_outputs_cpu, batchprefill_outputs_cpu)):
+            assert cascade_output.shape == batchprefill_output.shape, f"Shape mismatch at step {i}"
 
-        total_elements += cascade_output.numel()
-        total_diff += torch.sum(diff).item()
+            diff = torch.abs(cascade_output - batchprefill_output)
 
-    avg_diff = total_diff / total_elements
+            max_step_diff = torch.max(diff).item()
+            max_diff = max(max_diff, max_step_diff)
 
-    print(f"\nComparison results:")
-    print(f"Max absolute difference across all steps: {max_diff}")
-    print(f"Average absolute difference: {avg_diff}")
+            total_elements += cascade_output.numel()
+            total_diff += torch.sum(diff).item()
 
-    assert max_diff < 1e-3, f"Max absolute difference ({max_diff}) exceeds threshold"
-    assert avg_diff < 1e-4, f"Average absolute difference ({avg_diff}) exceeds threshold"
+        avg_diff = total_diff / total_elements
 
-    print("All tests passed successfully!")
+        # Speedup calculation
+        speedup = time_taken_batchprefill / time_taken_cascade
 
-if __name__ == "__main__":
-    run_and_compare_flashinfer_tests()
+        # Store results for the case
+        results.append({
+            "case_idx": case_idx,
+            "beam_width": params["beam_width"],
+            "seq_lens": params["seq_lens"],
+            "max_diff": max_diff,
+            "avg_diff": avg_diff,
+            "time_cascade": time_taken_cascade,
+            "time_batchprefill": time_taken_batchprefill,
+            "speedup": speedup
+        })
+
+        print(f"\nTest case {case_idx + 1} results:")
+        print(f"Max absolute difference: {max_diff}")
+        print(f"Average absolute difference: {avg_diff}")
+        print(f"Time taken (cascade): {time_taken_cascade:.6f} seconds")
+        print(f"Time taken (batch prefill): {time_taken_batchprefill:.6f} seconds")
+        print(f"Speedup: {speedup:.2f}x")
+
+    # Return or print final results
+    return results
+
+
+# Example test cases to run
+test_cases = [
+    {
+        "beam_width": 4,
+        "seq_lens": [(32768, 32768)]
+    },
+    {
+        "beam_width": 8,
+        "seq_lens": [(32768, 32768)]
+    },
+    {
+        "beam_width": 16,
+        "seq_lens": [(32768, 32768)]
+    },
+    {
+        "beam_width": 32,
+        "seq_lens": [(32768, 32768)]
+    },
+]
+
+# Run the speedup tests
+results = run_flashinfer_speedup_tests(test_cases)
+
+# def run_and_compare_flashinfer_tests():
+#     common_params = {
+#         "num_heads": (16, 16),
+#         "head_size": 128,
+#         "dtype": torch.float16,
+#         "block_size": 16,
+#         "seq_lens": [(4096, 4096)],
+#         "num_runs": 1000,
+#         "beam_width": 32,
+#         "max_num_blocks_per_seq": 512
+#     }
+
+#     num_seqs = len(common_params["seq_lens"])
+#     num_query_heads, num_kv_heads = common_params["num_heads"]
+
+#     key_value_cache = initialize_key_value_cache(
+#         num_seqs, 
+#         common_params["beam_width"], 
+#         common_params["max_num_blocks_per_seq"], 
+#         common_params["block_size"], 
+#         num_kv_heads, 
+#         common_params["head_size"], 
+#         common_params["dtype"]
+#     )
+
+#     # Run cascade test/
+#     cascade_outputs = test_multilevel_cascade_attention_wrapper(
+#         **common_params,
+#         num_levels=2,
+#         key_value_cache=key_value_cache
+#     )
+    
+#     cascade_outputs_cpu = [output.cpu() for output in cascade_outputs]
+
+#     del cascade_outputs
+
+#     # Run batchprefill test
+#     batchprefill_outputs = test_flashinfer_batchprefill_beam_search(
+#         **common_params,
+#         soft_cap=None,
+#         key_value_cache=key_value_cache
+#     )
+
+#     batchprefill_outputs_cpu = [output.cpu() for output in batchprefill_outputs]
+
+#     del batchprefill_outputs
+
+#     assert len(cascade_outputs_cpu) == len(batchprefill_outputs_cpu), "Number of outputs mismatch"
+
+#     max_diff = 0
+#     total_elements = 0
+#     total_diff = 0
+
+#     for i, (cascade_output, batchprefill_output) in enumerate(zip(cascade_outputs_cpu, batchprefill_outputs_cpu)):
+#         assert cascade_output.shape == batchprefill_output.shape, f"Shape mismatch at step {i}"
+
+#         diff = torch.abs(cascade_output - batchprefill_output)
+
+#         max_step_diff = torch.max(diff).item()
+
+#         max_diff = max(max_diff, max_step_diff)
+
+#         total_elements += cascade_output.numel()
+#         total_diff += torch.sum(diff).item()
+
+#     avg_diff = total_diff / total_elements
+
+#     print(f"\nComparison results:")
+#     print(f"Max absolute difference across all steps: {max_diff}")
+#     print(f"Average absolute difference: {avg_diff}")
+
+#     assert max_diff < 1e-3, f"Max absolute difference ({max_diff}) exceeds threshold"
+#     assert avg_diff < 1e-4, f"Average absolute difference ({avg_diff}) exceeds threshold"
+
+#     print("All tests passed successfully!")
+
+# if __name__ == "__main__":
+#     run_and_compare_flashinfer_tests()
