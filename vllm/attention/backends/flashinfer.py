@@ -5,7 +5,7 @@ from os.path import commonprefix
 try:
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    from flashinfer.cascade import (BatchPrefillWithSharedPrefixPagedKVCacheWrapper, BatchDecodeWithSharedPrefixPagedKVCacheWrapper)
+    from flashinfer.cascade import (MultiLevelCascadeAttentionWrapper)
     import vllm.attention.backends.flash_attn  # noqa
 except ImportError:
     BatchDecodeWithPagedKVCacheWrapper = None
@@ -89,6 +89,8 @@ class FlashInferMetadata(AttentionMetadata):
     prefill_shared_wrapper: Optional[BatchPrefillWithSharedPrefixPagedKVCacheWrapper] = None
     decode_shared_wrapper: Optional[BatchDecodeWithSharedPrefixPagedKVCacheWrapper] = None
 
+    wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
+
     # Metadata for the prefill stage
     seq_start_loc: Optional[torch.Tensor] = None
     query_start_loc: Optional[torch.Tensor] = None
@@ -110,6 +112,15 @@ class FlashInferMetadata(AttentionMetadata):
     # the paged kv cache, shape: [batch_size]
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # The number of query/output heads
+
+    unique_query_start_loc: Optional[torch.Tensor] = None 
+
+    unique_kv_last_page_len: Optional[torch.Tensor] = None
+
+    unique_paged_kv_indices: Optional[torch.Tensor] = None
+
+    unique_paged_kv_indptr: Optional[torch.Tensor] = None
+    
     num_qo_heads: Optional[int] = None
     # The number of key/value heads
     num_kv_heads: Optional[int] = None
@@ -133,6 +144,37 @@ class FlashInferMetadata(AttentionMetadata):
                 f"Only {supported_head_sizes} are supported for head_dim,",
                 f"received {self.head_dim}.")
 
+    def plan(self):
+        if not self.is_profile_run:
+            self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
+
+            self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
+                self.device)
+            
+            self.paged_kv_indices = self.paged_kv_indices.to(self.device)
+
+            self.unique_kv_last_page_len = self.unique_kv_last_page_len.to(
+                self.device
+            )
+            self.unique_paged_kv_indices = self.unique_paged_kv_indices.to(
+                self.device
+            )
+            self.unique_paged_kv_indptr = self.unique_paged_kv_indptr.to(
+                self.device
+            )
+
+            self.wrapper.plan(
+                [self.query_start_loc, self.unique_query_start_loc],
+                [self.paged_kv_indices, self.unique_paged_kv_indices],
+                [self.paged_kv_indptr, self.unique_paged_kv_indptr],
+                [self.paged_kv_last_page_len, self.unique_kv_last_page_len],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.page_size
+            )
+         
+         
     def begin_forward(self):
         if self.num_prefill_tokens > 0:
             if self.paged_kv_indices is None:
@@ -159,13 +201,16 @@ class FlashInferMetadata(AttentionMetadata):
                     self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
-
+                print("QUERY START LOC", self.query_start_loc)
                 self.prefill_shared_wrapper.end_forward()
                 self.prefill_shared_wrapper.begin_forward(
                     self.query_start_loc, self.paged_kv_indptr,
                     self.paged_kv_indices, self.paged_kv_last_page_len,
                     self.num_qo_heads, self.num_kv_heads, self.head_dim,
                     self.page_size)
+                print(self.paged_kv_indices)
+                print("PREFILL")
+                print(self.paged_kv_indices)
         else:
             if not self.use_cuda_graph:
                 assert self.paged_kv_indices is not None
@@ -175,6 +220,8 @@ class FlashInferMetadata(AttentionMetadata):
                 self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
                 self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                     self.device)
+
+            print(self.paged_kv_indices)
             assert self.decode_wrapper is not None
             self.decode_wrapper.end_forward()
             self.decode_wrapper.begin_forward(
@@ -269,12 +316,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # paged_kv_last_page_len is the length of the last page of each request
         self.paged_kv_last_page_len: List[int] = []
 
+        self.unique_kv_indices: List[int] = []
+
+        self.unique_paged_kv_indptr: List[int] = [0]
+
+        self.unique_paged_kv_last_page_len: List[int] = []
+        
         self.is_profile_run: bool = False
-        self.shared_blocks = 0
+        # self.shared_blocks = 0
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
-            chunked_prefill_enabled: bool, common_prefix: int):
+            chunked_prefill_enabled: bool):
         """Add a sequence group to the metadata. Specifically update/append
         1. context length.
         2. block table.
@@ -306,7 +359,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # only allowing multiple of block_size chunk size.
             # NOTE: This only works for oooooooxxx style attention.
             block_table = []
-            shared_prefix_len = common_prefix * self.block_size
             if inter_data.prefix_cache_hit:
                 block_table = computed_block_nums
             elif ((chunked_prefill_enabled or not is_prompt)
@@ -331,31 +383,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.is_profile_run = is_profile_run
                 return
             block_table = block_tables[seq_id]
-            if not is_prompt: 
-                self._update_shared_paged_kv_tensors(block_table, seq_len, shared_prefix_len)
-            else:
-                self._update_paged_kv_tensors(block_table, seq_len)
-            # self._update_paged_kv_tensors(block_table, seq_len)
-
-    def _update_shared_paged_kv_tensors(self, block_table: List[int], seq_len: int, shared_prefix_len: int):
-        shared_prefix_blocks = shared_prefix_len // self.block_size
-
-        if shared_prefix_len % self.block_size != 0:
-            shared_prefix_blocks += 1
-
-        unique_seq_len = max(0, seq_len - shared_prefix_len)
-
-        unique_block_table_bound = unique_seq_len // self.block_size
-        if unique_seq_len % self.block_size != 0:
-            unique_block_table_bound += 1
-
-        self.paged_kv_indices.extend([block - shared_prefix_blocks for block in block_table[shared_prefix_blocks: shared_prefix_blocks+unique_block_table_bound]])
-
-        self.paged_kv_indptr.append(self.paged_kv_indptr[-1] + unique_block_table_bound)
-
-        last_page_len = seq_len % self.block_size
-
-        self.paged_kv_last_page_len.append(last_page_len)
+            self._update_paged_kv_tensors(block_table, seq_len)
 
     def _update_paged_kv_tensors(self, block_table: List[int], seq_len: int):
         # Get the number of valid blocks based on sequence length.
@@ -363,6 +391,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # block_table_bound is 1 with 1 valid block.
         # If seq_len = 15, block_size = 16,
         # block_table_bound is 0 + 1 with 1 valid block.
+
+        ## still haven't implemented shared blocks
         
         block_table_bound = seq_len // self.block_size + 1 \
                             if seq_len % self.block_size != 0 \
@@ -376,22 +406,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             last_page_len = self.block_size
         self.paged_kv_last_page_len.append(last_page_len)
 
-    def get_shared_blocks_nums(self, inter_data_list):
-        block_id_lists = [
-            list(data.block_tables.values())
-            for data in inter_data_list
-            if data.block_tables
-        ]
-        flattened_lists = [item for sublist in block_id_lists for item in sublist]
-        if len(flattened_lists) == 1:
-            return flattened_lists[0]
-        
-        common_prefix = commonprefix(flattened_lists)
+        # block_table_bound = seq_len // self.block_size + 1 if seq_len % self.block_size != 0 else seq_len // self.block_size
 
-        for i in range(1, len(common_prefix)):
-            if common_prefix[i] != common_prefix[i-1] + 1:
-                return common_prefix[:i]
-        return common_prefix
+        # self.unique_kv_indices.extend(block_table[:block_table_bound])
+
+        # self.unique_paged_kv_indptr.append(self.unique_paged_kv_indptr[-1] + block_table_bound)
+
+        # last_page_len = seq_len % self.block_size
+
+        # if last_page_len == 0:
+        #     last_page_len = self.block_size
+        # self.unique_paged_kv_last_page_len.append(last_page_len)
+
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):
@@ -404,11 +430,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                  -1 if cuda graph is not used.
             batch_size: The maybe padded batch size.
         """
-        common_prefix = self.get_shared_blocks_nums(self.input_builder.inter_data_list)
-        shared_blocks = len(common_prefix)
         for inter_data in self.input_builder.inter_data_list:
             self._add_seq_group(inter_data,
-                                self.input_builder.chunked_prefill_enabled, shared_blocks)
+                                self.input_builder.chunked_prefill_enabled)
 
         device = self.runner.device
         use_captured_graph = cuda_graph_pad_size != -1
@@ -454,6 +478,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
                                       dtype=torch.int32,
                                       device=device)
+        unique_query_start_loc = torch.zeros(1)
         seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
                                     dtype=torch.int32,
                                     device=device)
@@ -465,6 +490,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                      dim=0,
                      dtype=query_start_loc.dtype,
                      out=query_start_loc[1:])
+        
+        print("QUERY START LOC")
+        print(query_start_loc)
         
         if len(self.paged_kv_indptr) > 0:
             paged_kv_indices_tensor = torch.tensor(self.paged_kv_indices,
@@ -479,6 +507,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             paged_kv_indices_tensor = None
             paged_kv_indptr_tensor = None
             paged_kv_last_page_len_tensor = None
+            unique_kv_indices_tensor = None
+            unique_kv_indptr_tensor = None
+            unique_kv_last_page_len_tensor = None
 
         kv_cache_dtype = get_kv_cache_torch_dtype(
             self.runner.kv_cache_dtype, self.runner.model_config.dtype)
@@ -492,6 +523,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             paged_kv_indptr=paged_kv_indptr_tensor,
             paged_kv_indices=paged_kv_indices_tensor,
             paged_kv_last_page_len=paged_kv_last_page_len_tensor,
+            unique_paged_kv_indptr=unique_kv_indices_tensor,
+            unique_kv_indices=unique_kv_indices_tensor,
+            unique_kv_last_page_len=unique_kv_last_page_len_tensor,
             num_qo_heads=self.runner.model_config.get_num_attention_heads(
                 self.runner.parallel_config),
             num_kv_heads=self.runner.model_config.get_num_kv_heads(
@@ -500,11 +534,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             page_size=self.block_size,
             seq_start_loc=seq_start_loc,
             query_start_loc=query_start_loc,
+            unique_query_start_loc=unique
             device=device,
             data_type=kv_cache_dtype,
             use_cuda_graph=use_captured_graph,
-            is_profile_run=self.is_profile_run,
-            shared_blocks=shared_blocks)
+            is_profile_run=self.is_profile_run)
 
 
 class FlashInferImpl(AttentionImpl):
@@ -603,37 +637,56 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache,
                     logits_soft_cap=self.logits_soft_cap,
                     causal=True)
-                # shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
-                # unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
-                # shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
-                # output = prefill_meta.prefill_shared_wrapper.forward(
-                #     query, 
-                #     shared_kv_cache_reshaped[:, 0],
-                #     shared_kv_cache_reshaped[:, 1],
-                #     unique_kv_cache,
-                #     causal=True
-                # )
         else:
-            if attn_metadata.decode_shared_wrapper:
-                shared_kv_cache = kv_cache[:attn_metadata.shared_blocks, ...]
-                unique_kv_cache = kv_cache[attn_metadata.shared_blocks:, ...]
-                shared_kv_cache_reshaped = shared_kv_cache.transpose(1, 2).reshape(-1, 2, self.num_kv_heads, self.head_size)
+            assert attn_metadata.decode_metadata is not None
+            assert attn_metadata.decode_metadata.decode_wrapper is not None
+            output = attn_metadata.decode_metadata.decode_wrapper.forward(
+                query,
+                kv_cache,
+                sm_scale=self.scale,
+                logits_soft_cap=self.logits_soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale)
 
-                output = attn_metadata.decode_metadata.decode_shared_wrapper.forward(
-                    query,
-                    shared_kv_cache_reshaped[:, 0],
-                    shared_kv_cache_reshaped[:, 1],
-                    unique_kv_cache,
-                )
-            else:
-                assert attn_metadata.decode_metadata is not None
-                assert attn_metadata.decode_metadata.decode_wrapper is not None
-                output = attn_metadata.decode_metadata.decode_wrapper.forward(
-                    query,
-                    kv_cache,
-                    sm_scale=self.scale,
-                    logits_soft_cap=self.logits_soft_cap,
-                    k_scale=k_scale,
-                    v_scale=v_scale)
 
         return output.view(num_tokens, hidden_size)
+
+
+
+    # def _update_shared_paged_kv_tensors(self, block_table: List[int], seq_len: int, shared_prefix_len: int):
+    #     shared_prefix_blocks = shared_prefix_len // self.block_size
+
+    #     if shared_prefix_len % self.block_size != 0:
+    #         shared_prefix_blocks += 1
+
+    #     unique_seq_len = max(0, seq_len - shared_prefix_len)
+
+    #     unique_block_table_bound = unique_seq_len // self.block_size
+    #     if unique_seq_len % self.block_size != 0:
+    #         unique_block_table_bound += 1
+
+    #     self.paged_kv_indices.extend([block - shared_prefix_blocks for block in block_table[shared_prefix_blocks: shared_prefix_blocks+unique_block_table_bound]])
+
+    #     self.paged_kv_indptr.append(self.paged_kv_indptr[-1] + unique_block_table_bound)
+
+    #     last_page_len = seq_len % self.block_size
+
+    #     self.paged_kv_last_page_len.append(last_page_len)
+
+
+        # def get_shared_blocks_nums(self, inter_data_list):
+    #     block_id_lists = [
+    #         list(data.block_tables.values())
+    #         for data in inter_data_list
+    #         if data.block_tables
+    #     ]
+    #     flattened_lists = [item for sublist in block_id_lists for item in sublist]
+    #     if len(flattened_lists) == 1:
+    #         return flattened_lists[0]
+        
+    #     common_prefix = commonprefix(flattened_lists)
+
+    #     for i in range(1, len(common_prefix)):
+    #         if common_prefix[i] != common_prefix[i-1] + 1:
+    #             return common_prefix[:i]
+    #     return common_prefix
