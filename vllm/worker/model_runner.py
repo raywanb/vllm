@@ -17,7 +17,7 @@ try:
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.decode import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-    from flashinfer.cascade import BatchPrefillWithSharedPrefixPagedKVCacheWrapper, BatchDecodeWithSharedPrefixPagedKVCacheWrapper
+    from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 except ImportError:
     BatchDecodeWithPagedKVCacheWrapper = None
@@ -877,10 +877,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.flashinfer_decode_wrapper = None
         self.flashinfer_prefill_workspace_buffer = None
         self.flashinfer_prefill_wrapper = None
-        self.flashinfer_prefill_shared_workspace_buffer = None
-        self.flashinfer_prefill_shared_wrapper = None
-        self.flashinfer_decode_shared_workspace_buffer = None
-        self.flashinfer_decode_shared_wrapper = None
+        self.flashinfer_multi_wrapper = None
+        self.flashinfer_multi_workspace_buffer = None
 
         set_cpu_offload_max_bytes(
             int(self.cache_config.cpu_offload_gb * 1024**3))
@@ -1484,53 +1482,33 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if self.attn_backend.get_name() == "flashinfer":
             assert model_input.attn_metadata is not None
             assert model_input.input_tokens is not None
-            if self.flashinfer_decode_workspace_buffer is None:
-                self.flashinfer_decode_workspace_buffer = torch.empty(
-                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
-                    dtype=torch.uint8,
-                    device=self.device)
-                self.flashinfer_decode_wrapper = \
-                    BatchDecodeWithPagedKVCacheWrapper(
-                    self.flashinfer_decode_workspace_buffer, "NHD")
-                self.flashinfer_prefill_workspace_buffer = torch.empty(
-                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
-                    dtype=torch.uint8,
-                    device=self.device)
-                self.flashinfer_prefill_wrapper = \
-                    BatchPrefillWithPagedKVCacheWrapper(
-                    self.flashinfer_prefill_workspace_buffer, "NHD")
-                self.flashinfer_prefill_shared_workspace_buffer = torch.empty(
-                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
-                    dtype=torch.uint8,
-                    device=self.device
-                )
-                self.flashinfer_prefill_shared_wrapper = \
-                    BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
-                        self.flashinfer_prefill_shared_workspace_buffer, "NHD")
-                self.flashinfer_decode_shared_workspace_buffer = torch.empty(
-                    1024 * 1024 * 1024,
-                    dtype=torch.uint8,
-                    device=self.device
-                )
-                self.flashinfer_decode_shared_wrapper = \
-                    BatchDecodeWithSharedPrefixPagedKVCacheWrapper(
-                        self.flashinfer_decode_shared_workspace_buffer, "NHD"
-                    )
-                
+            # if self.flashinfer_decode_workspace_buffer is None:
+            #     self.flashinfer_decode_workspace_buffer = torch.empty(
+            #         FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            #         dtype=torch.uint8,
+            #         device=self.device)
+            #     self.flashinfer_decode_wrapper = \
+            #         BatchDecodeWithPagedKVCacheWrapper(
+            #         self.flashinfer_decode_workspace_buffer, "NHD")
+            #     self.flashinfer_prefill_workspace_buffer = torch.empty(
+            #         FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            #         dtype=torch.uint8,
+            #         device=self.device)
+            #     self.flashinfer_prefill_wrapper = \
+            #         BatchPrefillWithPagedKVCacheWrapper(
+            #         self.flashinfer_prefill_workspace_buffer, "NHD")
 
-            model_input.attn_metadata.prefill_wrapper = \
-                self.flashinfer_prefill_wrapper
-            model_input.attn_metadata.prefill_shared_wrapper = self.flashinfer_prefill_shared_wrapper
-            model_input.attn_metadata.decode_shared_wrapper = self.flashinfer_decode_shared_wrapper
-            if model_input.attn_metadata.use_cuda_graph:
-                batch_size = model_input.input_tokens.shape[0]
-                model_input.attn_metadata.decode_wrapper = self.graph_runners[
-                    model_input.
-                    virtual_engine][batch_size].flashinfer_decode_wrapper
-            else:
-                model_input.attn_metadata.decode_wrapper = \
-                    self.flashinfer_decode_wrapper
-            model_input.attn_metadata.begin_forward()
+            if self.flashinfer_multi_workspace_buffer is None:
+                self.flashinfer_multi_workspace_buffer = torch.empty(
+                    FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                    dtype=torch.uint8,
+                    device=self.device)
+                self.flashinfer_multi_wrapper = MultiLevelCascadeAttentionWrapper(
+                    2, self.flashinfer_multi_workspace_buffer, "NHD"
+                )
+                
+            model_input.attn_metadata.plan()
+            # model_input.attn_metadata.begin_forward()
 
         # Currently cuda graph is only supported by the decode phase.
         assert model_input.attn_metadata is not None
@@ -1647,13 +1625,6 @@ class CUDAGraphRunner:
 
         self._graph: Optional[torch.cuda.CUDAGraph] = None
 
-        self.flashinfer_decode_workspace_buffer: Optional[torch.Tensor] = None
-        self.flashinfer_indptr_buffer: Optional[torch.Tensor] = None
-        self.flashinfer_indices_buffer: Optional[torch.Tensor] = None
-        self.flashinfer_last_page_len_buffer: Optional[torch.Tensor] = None
-        self.flashinfer_decode_wrapper: Optional[
-            CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = None
-
     @property
     def graph(self):
         assert self._graph is not None
@@ -1718,25 +1689,17 @@ class CUDAGraphRunner:
         torch.cuda.synchronize()
 
         # Save the input and output buffers.
-        if self.backend_name == "flashinfer":
-            self.input_buffers = {
-                "input_ids": input_ids,
-                "positions": positions,
-                "kv_caches": kv_caches,
-                "slot_mapping": attn_metadata.slot_mapping,
-                **kwargs,
-            }
-        else:
-            self.input_buffers = {
-                "input_ids": input_ids,
-                "positions": positions,
-                "kv_caches": kv_caches,
-                "slot_mapping": attn_metadata.slot_mapping,
-                "seq_lens_tensor":
-                attn_metadata.decode_metadata.seq_lens_tensor,
-                "block_tables": attn_metadata.decode_metadata.block_tables,
-                **kwargs,
-            }
+
+        self.input_buffers = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "kv_caches": kv_caches,
+            "slot_mapping": attn_metadata.slot_mapping,
+            "seq_lens_tensor":
+            attn_metadata.decode_metadata.seq_lens_tensor,
+            "block_tables": attn_metadata.decode_metadata.block_tables,
+            **kwargs,
+        }
         if intermediate_inputs is not None:
             self.input_buffers.update(intermediate_inputs.tensors)
         if get_pp_group().is_last_rank:
