@@ -1503,10 +1503,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     FLASHINFER_WORKSPACE_BUFFER_SIZE,
                     dtype=torch.uint8,
                     device=self.device)
+            if self.flashinfer_multi_wrapper is None:
                 self.flashinfer_multi_wrapper = MultiLevelCascadeAttentionWrapper(
-                    2, self.flashinfer_multi_workspace_buffer, "NHD"
+                    1, self.flashinfer_multi_workspace_buffer, "NHD"
                 )
-                
+            
+            model_input.attn_metadata.wrapper = self.flashinfer_multi_wrapper
             model_input.attn_metadata.plan()
             # model_input.attn_metadata.begin_forward()
 

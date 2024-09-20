@@ -87,8 +87,6 @@ class FlashInferMetadata(AttentionMetadata):
 
     prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
     decode_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
-    prefill_shared_wrapper: Optional[BatchPrefillWithSharedPrefixPagedKVCacheWrapper] = None
-    decode_shared_wrapper: Optional[BatchDecodeWithSharedPrefixPagedKVCacheWrapper] = None
 
     wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
 
@@ -119,9 +117,9 @@ class FlashInferMetadata(AttentionMetadata):
 
     unique_kv_last_page_len: Optional[torch.Tensor] = None
 
-    unique_paged_kv_indices: Optional[torch.Tensor] = None
+    unique_kv_indices: Optional[torch.Tensor] = None
 
-    unique_paged_kv_indptr: Optional[torch.Tensor] = None
+    unique_kv_indptr: Optional[torch.Tensor] = None
     
     num_qo_heads: Optional[int] = None
     # The number of key/value heads
@@ -148,6 +146,7 @@ class FlashInferMetadata(AttentionMetadata):
 
     def plan(self):
         if not self.is_profile_run:
+            assert self.wrapper is not None
             self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
 
             self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
@@ -158,18 +157,24 @@ class FlashInferMetadata(AttentionMetadata):
             self.unique_kv_last_page_len = self.unique_kv_last_page_len.to(
                 self.device
             )
-            self.unique_paged_kv_indices = self.unique_paged_kv_indices.to(
+            self.unique_kv_indices = self.unique_kv_indices.to(
                 self.device
             )
-            self.unique_paged_kv_indptr = self.unique_paged_kv_indptr.to(
+            self.unique_kv_indptr = self.unique_kv_indptr.to(
                 self.device
             )
 
+            # print("PAGED KV INDPTR", self.paged_kv_indptr, self.paged_kv_indptr.shape)
+            # print("PAGED KV INDICES", self.paged_kv_indices, self.paged_kv_indices.shape)
+            # print("UNIQUE INDICES", self.unique_kv_indices, self.unique_kv_indices.shape)
+            # print("UNIQUE INDPTR", self.unique_kv_indptr, self.unique_kv_indptr.shape)
+            # print([self.query_start_loc, self.unique_query_start_loc])
+            # print("LAST PAGE LEN", [self.paged_kv_last_page_len, self.unique_kv_last_page_len])
             self.wrapper.plan(
-                [self.query_start_loc, self.unique_query_start_loc],
-                [self.paged_kv_indices, self.unique_paged_kv_indices],
-                [self.paged_kv_indptr, self.unique_paged_kv_indptr],
-                [self.paged_kv_last_page_len, self.unique_kv_last_page_len],
+                [self.query_start_loc],
+                [self.paged_kv_indptr],
+                [self.paged_kv_indices],
+                [self.paged_kv_last_page_len],
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -395,29 +400,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         ## still haven't implemented shared blocks
         
-        # block_table_bound = seq_len // self.block_size + 1 \
-        #                     if seq_len % self.block_size != 0 \
-        #                     else seq_len // self.block_size
-        # self.paged_kv_indices.extend(block_table[:block_table_bound])
-        # self.paged_kv_indptr.append(self.paged_kv_indptr[-1] +
-        #                             block_table_bound)
-
-        # last_page_len = seq_len % self.block_size
-        # if last_page_len == 0:
-        #     last_page_len = self.block_size
-        # self.paged_kv_last_page_len.append(last_page_len)
-
-        block_table_bound = seq_len // self.block_size + 1 if seq_len % self.block_size != 0 else seq_len // self.block_size
-
-        self.unique_kv_indices.extend(block_table[:block_table_bound])
-
-        self.unique_paged_kv_indptr.append(self.unique_paged_kv_indptr[-1] + block_table_bound)
+        block_table_bound = seq_len // self.block_size + 1 \
+                            if seq_len % self.block_size != 0 \
+                            else seq_len // self.block_size
+        self.paged_kv_indices.extend(block_table[:block_table_bound])
+        self.paged_kv_indptr.append(self.paged_kv_indptr[-1] +
+                                    block_table_bound)
 
         last_page_len = seq_len % self.block_size
-
         if last_page_len == 0:
             last_page_len = self.block_size
-        self.unique_paged_kv_last_page_len.append(last_page_len)
+        self.paged_kv_last_page_len.append(last_page_len)
+
+        # block_table_bound = seq_len // self.block_size + 1 if seq_len % self.block_size != 0 else seq_len // self.block_size
+
+        # self.unique_kv_indices.extend(block_table[:block_table_bound])
+
+        # self.unique_paged_kv_indptr.append(self.unique_paged_kv_indptr[-1] + block_table_bound)
+
+        # last_page_len = seq_len % self.block_size
+
+        # if last_page_len == 0:
+        #     last_page_len = self.block_size
+        # self.unique_paged_kv_last_page_len.append(last_page_len)
+
+        # self.paged_kv_last_page_len.append(0)
 
 
     def build(self, seq_lens: List[int], query_lens: List[int],
@@ -457,20 +464,55 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                              self.runner.pin_memory)
         slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
                                                device, self.runner.pin_memory)
-        query_start_loc = torch.tensor([0, query_lens_tensor.shape[0]],
-                               dtype=torch.int32,
-                               device=device)
-        unique_query_start_loc = torch.arange(query_lens_tensor[0]+1,
-                                              dtype=torch.int32,
-                                              device=device)
+        
+        # print("QUERY LEN TENSOR", query_lens_tensor)
+        # query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
+        #                        dtype=torch.int32,
+        #                        device=device)
+        unique_query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
+                                    dtype=torch.int32,
+                                    device=device)
+        # seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
+        #                             dtype=torch.int32,
+        #                             device=device) ##this is needed for flashattn
+        # torch.cumsum(seq_lens_tensor,
+        #              dim=0,
+        #              dtype=seq_start_loc.dtype,
+        #              out=seq_start_loc[1:])
+        
+        # torch.cumsum(query_lens_tensor,
+        #              dim=0,
+        #              dtype=query_start_loc.dtype,
+        #              out=unique_query_start_loc[1:])
 
+        # torch.cumsum(query_lens_tensor,
+        #         dim=0,
+        #         dtype=query_start_loc.dtype,
+        #         out=query_start_loc[1:])
+
+        seq_lens_tensor = async_tensor_h2d(seq_lens, torch.int, device,
+                                           self.runner.pin_memory)
+        query_lens_tensor = async_tensor_h2d(query_lens, torch.long, device,
+                                             self.runner.pin_memory)
+        slot_mapping_tensor = async_tensor_h2d(self.slot_mapping, torch.long,
+                                               device, self.runner.pin_memory)
+        query_start_loc = torch.zeros(query_lens_tensor.shape[0] + 1,
+                                      dtype=torch.int32,
+                                      device=device)
         seq_start_loc = torch.zeros(seq_lens_tensor.shape[0] + 1,
                                     dtype=torch.int32,
-                                    device=device) ##this is needed for flashattn
+                                    device=device)
         torch.cumsum(seq_lens_tensor,
                      dim=0,
                      dtype=seq_start_loc.dtype,
                      out=seq_start_loc[1:])
+        torch.cumsum(query_lens_tensor,
+                     dim=0,
+                     dtype=query_start_loc.dtype,
+                     out=query_start_loc[1:])
+
+        
+        # print("UNIQUE QUERY LEN START", unique_query_start_loc)
     
         if len(self.paged_kv_indptr) > 0:
             paged_kv_indices_tensor = torch.tensor(self.paged_kv_indices,
@@ -481,6 +523,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                                   dtype=torch.int)
             paged_kv_last_page_len_tensor = torch.tensor(
                 self.paged_kv_last_page_len, device="cpu", dtype=torch.int)
+            
+            unique_kv_indices_tensor = torch.tensor(self.unique_kv_indices,
+                                                    device="cpu",
+                                                    dtype=torch.int)
+
+            unique_kv_indptr_tensor = torch.tensor(self.unique_paged_kv_indptr,
+                                                   device="cpu",
+                                                   dtype=torch.int)
+            unique_kv_last_page_len_tensor = torch.tensor(self.unique_paged_kv_last_page_len,
+                                                          device="cpu",
+                                                          dtype=torch.int)
+            
         else:
             paged_kv_indices_tensor = None
             paged_kv_indptr_tensor = None
@@ -610,7 +664,6 @@ class FlashInferImpl(AttentionImpl):
                 )
             else:
                 assert prefill_meta.wrapper is not None
-
                 output = prefill_meta.wrapper.run(
                     query,
                     kv_cache)
@@ -620,7 +673,6 @@ class FlashInferImpl(AttentionImpl):
             output = attn_metadata.decode_metadata.wrapper.run(
                 query,
                 kv_cache)
-
 
         return output.view(num_tokens, hidden_size)
 
