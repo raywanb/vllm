@@ -701,7 +701,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                                            (block_table_bound - shared_length))
         # FIXME: this calculation will need to be changed
         # once shared level is working
-        last_page_len = (seq_len-16) % self.block_size
+        last_page_len = (seq_len) % self.block_size
         if last_page_len == 0:
             last_page_len = self.block_size
         self.second_layer_kv_last_page_len.append(last_page_len)
@@ -724,7 +724,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.paged_kv_indices.extend(common_prefix)
             self.paged_kv_indptr.append(self.paged_kv_indptr[-1] +
                                         len(common_prefix))
-            self.paged_kv_last_page_len.append(16)
+            self.paged_kv_last_page_len.append(self.block_size)
         
     def _update_normal_shared_kv_tensors(self, common_prefix: List[int],
                                   batch_size: int) -> None:
