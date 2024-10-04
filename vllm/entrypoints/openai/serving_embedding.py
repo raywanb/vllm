@@ -14,7 +14,7 @@ from vllm.entrypoints.openai.protocol import (EmbeddingRequest,
                                               EmbeddingResponse,
                                               EmbeddingResponseData,
                                               ErrorResponse, UsageInfo)
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_engine import BaseModelPath, OpenAIServing
 from vllm.logger import init_logger
 from vllm.outputs import EmbeddingOutput, EmbeddingRequestOutput
 from vllm.utils import merge_async_iterators, random_uuid
@@ -73,13 +73,13 @@ class OpenAIServingEmbedding(OpenAIServing):
         self,
         engine_client: EngineClient,
         model_config: ModelConfig,
-        served_model_names: List[str],
+        base_model_paths: List[BaseModelPath],
         *,
         request_logger: Optional[RequestLogger],
     ):
         super().__init__(engine_client=engine_client,
                          model_config=model_config,
-                         served_model_names=served_model_names,
+                         base_model_paths=base_model_paths,
                          lora_modules=None,
                          prompt_adapters=None,
                          request_logger=request_logger)
@@ -148,6 +148,7 @@ class OpenAIServingEmbedding(OpenAIServing):
                     pooling_params,
                     request_id_item,
                     lora_request=lora_request,
+                    priority=request.priority,
                 )
 
                 generators.append(generator)
