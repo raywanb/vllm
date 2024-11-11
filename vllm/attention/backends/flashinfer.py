@@ -7,8 +7,6 @@ from vllm.multimodal import MultiModalPlaceholderMap
 
 try:
     from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
-    from flashinfer.decode import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
-
     from vllm.vllm_flash_attn import flash_attn_varlen_func
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 except ImportError:
@@ -125,6 +123,40 @@ class FlashInferState(AttentionState):
             return self._cuda_wrapper
         return None
 
+    # @contextmanager
+    # def graph_capture(self, max_batch_size: int):
+    #     self._is_graph_capturing = True
+    #     self._graph_decode_wrapper = None
+    #     self._graph_slot_mapping = torch.full((max_batch_size, ),
+    #                                           PAD_SLOT_ID,
+    #                                           dtype=torch.long,
+    #                                           device=self.runner.device)
+    #     self._graph_seq_lens = torch.ones(max_batch_size,
+    #                                       dtype=torch.int32,
+    #                                       device=self.runner.device)
+    #     self._graph_block_tables = torch.from_numpy(
+    #         self.runner.graph_block_tables).to(device=self.runner.device)
+    #     self._graph_decode_workspace_buffer = self._get_workspace_buffer()
+    #     self._graph_indices_buffer = torch.empty(
+    #         max_batch_size * self.runner.cache_config.num_gpu_blocks,
+    #         dtype=torch.int32,
+    #         device=self.runner.device)
+    #     self._graph_indptr_buffer = torch.empty(max_batch_size + 1,
+    #                                             dtype=torch.int32,
+    #                                             device=self.runner.device)
+    #     self._graph_last_page_len_buffer = torch.empty(
+    #         max_batch_size, dtype=torch.int32, device=self.runner.device)
+    #     yield
+    #     self._is_graph_capturing = False
+    #     del self._graph_slot_mapping
+    #     del self._graph_seq_lens
+    #     del self._graph_block_tables
+    #     del self._graph_decode_workspace_buffer
+    #     del self._graph_indices_buffer
+    #     del self._graph_indptr_buffer
+    #     del self._graph_last_page_len_buffer
+    #     del self._graph_decode_wrapper
+
     @contextmanager
     def graph_capture(self, max_batch_size: int):
         self._is_graph_capturing = True
@@ -134,29 +166,60 @@ class FlashInferState(AttentionState):
                                               dtype=torch.long,
                                               device=self.runner.device)
         self._graph_seq_lens = torch.ones(max_batch_size,
-                                          dtype=torch.int32,
-                                          device=self.runner.device)
+                                    dtype=torch.int32,
+                                    device=self.runner.device)
         self._graph_block_tables = torch.from_numpy(
             self.runner.graph_block_tables).to(device=self.runner.device)
+        
         self._graph_decode_workspace_buffer = self._get_workspace_buffer()
-        self._graph_indices_buffer = torch.empty(
+
+        self._graph_indices_first_level_buffer = torch.empty(
             max_batch_size * self.runner.cache_config.num_gpu_blocks,
             dtype=torch.int32,
             device=self.runner.device)
-        self._graph_indptr_buffer = torch.empty(max_batch_size + 1,
+        
+        self._graph_indices_second_level_buffer = torch.empty(
+            max_batch_size * self.runner.cache_config.num_gpu_blocks,
+            dtype=torch.int32,
+            device=self.runner.device)
+        
+        self._graph_indptr_first_level_buffer = torch.empty(max_batch_size + 1,
                                                 dtype=torch.int32,
                                                 device=self.runner.device)
-        self._graph_last_page_len_buffer = torch.empty(
+        
+        self._graph_indptr_second_level_buffer = torch.empty(max_batch_size + 1,
+                                                dtype=torch.int32,
+                                                device=self.runner.device)
+        
+        self._graph_last_page_len_first_level_buffer = torch.empty(
             max_batch_size, dtype=torch.int32, device=self.runner.device)
+        
+        self._graph_last_page_len_second_level_buffer = torch.empty(
+            max_batch_size, dtype=torch.int32, device=self.runner.device)
+        
+        self._graph_query_start_loc_first_level_buffer = torch.empty(
+            max_batch_size, dtype=torch.int32, device=self.runner.device
+        )
+
+        self._graph_second_level_query_start_loc_buffer = torch.empty(
+            max_batch_size, dtype=torch.int32, device=self.runner.device
+        )
+
         yield
+
         self._is_graph_capturing = False
         del self._graph_slot_mapping
         del self._graph_seq_lens
         del self._graph_block_tables
         del self._graph_decode_workspace_buffer
-        del self._graph_indices_buffer
-        del self._graph_indptr_buffer
-        del self._graph_last_page_len_buffer
+        del self._graph_indices_first_level_buffer
+        del self._graph_indices_second_level_buffer
+        del self._graph_indptr_first_level_buffer
+        del self._graph_indptr_second_level_buffer
+        del self._graph_last_page_len_first_level_buffer
+        del self._graph_last_page_len_second_level_buffer
+        del self._graph_query_start_loc_first_level_buffer
+        del self._graph_second_level_query_start_loc_buffer
         del self._graph_decode_wrapper
 
     def graph_clone(self, batch_size: int):
@@ -170,20 +233,28 @@ class FlashInferState(AttentionState):
     def graph_capture_get_metadata_for_batch(
             self, batch_size: int, is_encoder_decoder_model: bool = False):
         assert self._is_graph_capturing
-        _indptr_buffer = self._graph_indptr_buffer[:batch_size + 1]
-        _last_page_len_buffer = self._graph_last_page_len_buffer[:batch_size]
+
+        _indptr_buffer_first_level = self._graph_indptr_first_level_buffer[:batch_size + 1]
+        _indptr_buffer_second_level = self._graph_indices_second_level_buffer[:batch_size + 1]
+
+        _last_page_len_first_level_buffer = self._graph_last_page_len_first_level_buffer[:batch_size]
+        _last_page_len_first_level_buffer = self._graph_last_page_len_second_level_buffer[:batch_size]
 
         num_qo_heads = (self.runner.model_config.get_num_attention_heads(
             self.runner.parallel_config))
         num_kv_heads = self.runner.model_config.get_num_kv_heads(
             self.runner.parallel_config)
-        use_tensor_cores = envs.VLLM_FLASHINFER_FORCE_TENSOR_CORES or (
-            num_qo_heads // num_kv_heads > 4)
+        # use_tensor_cores = envs.VLLM_FLASHINFER_FORCE_TENSOR_CORES or (
+        #     num_qo_heads // num_kv_heads > 4)
         self._graph_decode_wrapper = \
-            CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
-            self._graph_decode_workspace_buffer, _indptr_buffer,
-            self._graph_indices_buffer, _last_page_len_buffer, "NHD",
-            use_tensor_cores)
+            MultiLevelCascadeAttentionWrapper(
+                2, self._graph_decode_workspace_buffer, "NHD",
+                use_cuda_graph=True, qo_indptr_buf_arr=[self._graph_query_start_loc_first_level_buffer, self._graph_second_level_query_start_loc_buffer],
+                paged_kv_indptr_buf_arr=[_indptr_buffer_first_level, _indptr_buffer_second_level], 
+                paged_kv_indices_buf_arr=[self._graph_indices_first_level_buffer, self._graph_indices_second_level_buffer],
+                paged_kv_last_page_len_buf_arr=[_last_page_len_first_level_buffer, _last_page_len_first_level_buffer],
+            )
+
         if self.runner.kv_cache_dtype.startswith("fp8"):
             kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.runner.kv_cache_dtype)
@@ -203,6 +274,17 @@ class FlashInferState(AttentionState):
         query_start_loc_host = torch.arange(0,
                                             batch_size + 1,
                                             dtype=torch.int32)
+        
+        second_level_kv_indptr_tensor_host = torch.arange(0, batch_size+1, dtype=torch.int32)
+
+        second_level_kv_indices_tensor_host = torch.arange(0, batch_size, dtype=torch.int32)
+
+        second_level_kv_last_page_len_tensor_host = torch.full((batch_size, ),
+                                                        self.runner.block_size,
+                                                        dtype=torch.int32)
+        
+        second_level_query_start_loc_host = torch.arange(0, batch_size+1, dtype=torch.int32)
+
 
         attn_metadata = self.runner.attn_backend.make_metadata(
             num_prefills=0,
@@ -215,6 +297,10 @@ class FlashInferState(AttentionState):
             paged_kv_indptr=paged_kv_indptr_tensor_host,
             paged_kv_indices=paged_kv_indices_tensor_host,
             paged_kv_last_page_len=paged_kv_last_page_len_tensor_host,
+            second_level_kv_indptr=second_level_kv_indptr_tensor_host,
+            second_level_kv_indices=second_level_kv_indices_tensor_host,
+            second_level_kv_last_page_len=second_level_kv_last_page_len_tensor_host,
+            second_level_query_start_loc=second_level_query_start_loc_host,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=self.runner.model_config.get_head_size(),
@@ -289,7 +375,7 @@ class FlashInferMetadata(AttentionMetadata):
     use_cuda_graph: bool = True
 
     wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
-    cuda_wrapper: Optional[CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = None
+    cuda_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
 
     # Metadata for wrapper
     seq_start_loc: Optional[torch.Tensor] = None
@@ -310,12 +396,12 @@ class FlashInferMetadata(AttentionMetadata):
     # paged_kv_last_page_len is the length of the last page of the shared KVs
     paged_kv_last_page_len: Optional[torch.Tensor] = None
     # Store the concatenated page indices of all requests for the second layer
-    second_layer_kv_indices: Optional[torch.Tensor] = None
+    second_level_kv_indices: Optional[torch.Tensor] = None
     # Index pointers to the start of each request's page indices
-    # in the second_layer_kv_indices
-    second_layer_kv_indptr: Optional[torch.Tensor] = None
-    # The length of the last page of each request in the second layer
-    second_layer_kv_last_page_len: Optional[torch.Tensor] = None
+    # in the second_level_kv_indices
+    second_level_kv_indptr: Optional[torch.Tensor] = None
+    # The length of the last page of each request in the second level
+    second_level_kv_last_page_len: Optional[torch.Tensor] = None
 
     # The number of query/output heads
     num_qo_heads: Optional[int] = None
@@ -354,9 +440,9 @@ class FlashInferMetadata(AttentionMetadata):
             assert self.paged_kv_indices is not None
             assert self.paged_kv_indptr is not None
             assert self.paged_kv_last_page_len is not None
-            assert self.second_layer_kv_indices is not None
-            assert self.second_layer_kv_indptr is not None
-            assert self.second_layer_kv_last_page_len is not None
+            assert self.second_level_kv_indices is not None
+            assert self.second_level_kv_indptr is not None
+            assert self.second_level_kv_last_page_len is not None
             assert self.block_table_bound is not None
             assert self.seq_lens_tensor is not None
             self.query_start_loc = self.query_start_loc[:self.num_prefills + 1]
@@ -372,19 +458,19 @@ class FlashInferMetadata(AttentionMetadata):
                 self.block_table_bound = self.block_table_bound.to(self.device)
                 self.seq_lens_tensor = self.seq_lens_tensor.to(self.device)
                 self.paged_kv_indices = self.paged_kv_indices.to(self.device)
-                self.second_layer_kv_indices = self.second_layer_kv_indices.to(
+                self.second_level_kv_indices = self.second_level_kv_indices.to(
                     self.device)
-                self.second_layer_kv_indptr = self.second_layer_kv_indptr.to(
+                self.second_level_kv_indptr = self.second_level_kv_indptr.to(
                     self.device)
-                self.second_layer_kv_last_page_len = self.second_layer_kv_last_page_len.to(  # noqa: E501
+                self.second_level_kv_last_page_len = self.second_level_kv_last_page_len.to(  # noqa: E501
                     self.device)
 
                 self.wrapper.plan(
                     [self.query_start_loc, self.second_level_query_start_loc],
-                    [self.paged_kv_indptr, self.second_layer_kv_indptr],
-                    [self.paged_kv_indices, self.second_layer_kv_indices], [
+                    [self.paged_kv_indptr, self.second_level_kv_indptr],
+                    [self.paged_kv_indices, self.second_level_kv_indices], [
                         self.paged_kv_last_page_len,
-                        self.second_layer_kv_last_page_len
+                        self.second_level_kv_last_page_len
                     ],
                     self.num_qo_heads,
                     self.num_kv_heads,
@@ -395,56 +481,22 @@ class FlashInferMetadata(AttentionMetadata):
                     logits_soft_cap=logits_soft_cap)
 
         if self.num_decode_tokens > 0:
-            if self.cuda_wrapper:
-                assert self.paged_kv_indices is not None
-                assert self.paged_kv_indptr is not None
-                assert self.paged_kv_last_page_len is not None
-                self.paged_kv_indices = self.paged_kv_indices.to(self.device)
-                self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
-                self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
-                    self.device)
-                # handle model warmup path
-                if self.block_table_bound is not None:
-                    self.block_table_bound = self.block_table_bound.to(
-                        self.device)
-                if self.seq_lens_tensor is not None:
-                    self.seq_lens_tensor = self.seq_lens_tensor.to(self.device)
-
-                assert self.cuda_wrapper is not None
-                self.cuda_wrapper.end_forward()
-                self.cuda_wrapper.begin_forward(
-                    self.paged_kv_indptr[self.num_prefills:],
-                    self.paged_kv_indices,
-                    self.paged_kv_last_page_len[self.num_prefills:],
-                    self.num_qo_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    self.page_size,
-                    # Disable flashinfer's pos encoding and use vllm's rope.
-                    pos_encoding_mode="NONE",
-                    # kv-cache data type.
-                    data_type=self.data_type,
-                    # query data type.
-                    q_data_type=self.q_data_type)
-
-                return
-
             assert self.paged_kv_indices is not None
             assert self.paged_kv_indptr is not None
             assert self.paged_kv_last_page_len is not None
-            assert self.second_layer_kv_indices is not None
-            assert self.second_layer_kv_indptr is not None
-            assert self.second_layer_kv_last_page_len is not None
+            assert self.second_level_kv_indices is not None
+            assert self.second_level_kv_indptr is not None
+            assert self.second_level_kv_last_page_len is not None
 
             self.paged_kv_indices = self.paged_kv_indices.to(self.device)
             self.paged_kv_indptr = self.paged_kv_indptr.to(self.device)
             self.paged_kv_last_page_len = self.paged_kv_last_page_len.to(
                 self.device)
-            self.second_layer_kv_indices = self.second_layer_kv_indices.to(
+            self.second_level_kv_indices = self.second_level_kv_indices.to(
                 self.device)
-            self.second_layer_kv_indptr = self.second_layer_kv_indptr.to(
+            self.second_level_kv_indptr = self.second_level_kv_indptr.to(
                 self.device)
-            self.second_layer_kv_last_page_len = self.second_layer_kv_last_page_len.to(  # noqa: E501
+            self.second_level_kv_last_page_len = self.second_level_kv_last_page_len.to(  # noqa: E501
                 self.device)
 
             # handle model warmup path
@@ -453,14 +505,32 @@ class FlashInferMetadata(AttentionMetadata):
             if self.seq_lens_tensor is not None:
                 self.seq_lens_tensor = self.seq_lens_tensor.to(self.device)
 
+            if self.cuda_wrapper is not None:
+                self.cuda_wrapper.plan(
+                    [self.query_start_loc, self.second_level_query_start_loc],
+                    [self.paged_kv_indptr, self.second_level_kv_indptr],
+                    [self.paged_kv_indices, self.second_level_kv_indices], [
+                        self.paged_kv_last_page_len,
+                        self.second_level_kv_last_page_len
+                    ],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.page_size,
+                    causal=True,
+                    sm_scale=scale,
+                    logits_soft_cap=logits_soft_cap
+                    
+                )
+                return
+            
             assert self.wrapper is not None
-
             self.wrapper.plan(
                 [self.query_start_loc, self.second_level_query_start_loc],
-                [self.paged_kv_indptr, self.second_layer_kv_indptr],
-                [self.paged_kv_indices, self.second_layer_kv_indices], [
+                [self.paged_kv_indptr, self.second_level_kv_indptr],
+                [self.paged_kv_indices, self.second_level_kv_indices], [
                     self.paged_kv_last_page_len,
-                    self.second_layer_kv_last_page_len
+                    self.second_level_kv_last_page_len
                 ],
                 self.num_qo_heads,
                 self.num_kv_heads,
@@ -567,12 +637,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indptr: List[int] = [0]
         # The length of the last page of the shared kvs
         self.paged_kv_last_page_len: List[int] = []
-        # Store concatenated page indices of requests for the second layer
-        self.second_layer_kv_indices: List[int] = []
+        # Store concatenated page indices of requests for the second level
+        self.second_level_kv_indices: List[int] = []
         # Index pointers to the start of each request's page indices
-        self.second_layer_kv_indptr: List[int] = [0]
-        # The length of the last page of each request in the second layer
-        self.second_layer_kv_last_page_len: List[int] = []
+        self.second_level_kv_indptr: List[int] = [0]
+        # The length of the last page of each request in the second level
+        self.second_level_kv_last_page_len: List[int] = []
 
         self.total_blocks = 0
         self.is_profile_run: bool = False
@@ -672,14 +742,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         block_table_bound = (seq_len) // self.block_size + 1 \
                             if seq_len % self.block_size != 0 \
                             else (seq_len) // self.block_size
-        self.second_layer_kv_indices.extend(
+        self.second_level_kv_indices.extend(
             block_table[shared_length:block_table_bound])
-        self.second_layer_kv_indptr.append(self.second_layer_kv_indptr[-1] +
+        self.second_level_kv_indptr.append(self.second_level_kv_indptr[-1] +
                                            (block_table_bound - shared_length))
         last_page_len = (seq_len) % self.block_size
         if last_page_len == 0:
             last_page_len = self.block_size
-        self.second_layer_kv_last_page_len.append(last_page_len)
+        self.second_level_kv_last_page_len.append(last_page_len)
 
     def _update_shared_kv_tensors(self, common_prefix: List[int],
                                   batch_size: int) -> None:
@@ -846,8 +916,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if len(self.paged_kv_indptr) > 0:
             # extend to the maximum number of blocks as returned by the
             # scheduler
-            self.second_layer_kv_indices.extend(
-                [0] * (self.total_blocks - len(self.second_layer_kv_indices)))
+            self.second_level_kv_indices.extend(
+                [0] * (self.total_blocks - len(self.second_level_kv_indices)))
             paged_kv_indices_tensor = torch.tensor(self.paged_kv_indices,
                                                    device="cpu",
                                                    dtype=torch.int)
@@ -858,11 +928,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self.paged_kv_last_page_len, device="cpu", dtype=torch.int)
 
             second_level_kv_indices_tensor = torch.tensor(
-                self.second_layer_kv_indices, device="cpu", dtype=torch.int)
+                self.second_level_kv_indices, device="cpu", dtype=torch.int)
             second_level_kv_indptr_tensor = torch.tensor(
-                self.second_layer_kv_indptr, device="cpu", dtype=torch.int)
+                self.second_level_kv_indptr, device="cpu", dtype=torch.int)
             second_level_kv_last_page_len_tensor = torch.tensor(
-                self.second_layer_kv_last_page_len,
+                self.second_level_kv_last_page_len,
                 device="cpu",
                 dtype=torch.int)
 
@@ -898,9 +968,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             paged_kv_indptr=paged_kv_indptr_tensor,
             paged_kv_indices=paged_kv_indices_tensor,
             paged_kv_last_page_len=paged_kv_last_page_len_tensor,
-            second_layer_kv_indptr=second_level_kv_indptr_tensor,
-            second_layer_kv_indices=second_level_kv_indices_tensor,
-            second_layer_kv_last_page_len=second_level_kv_last_page_len_tensor,
+            second_level_kv_indptr=second_level_kv_indptr_tensor,
+            second_level_kv_indices=second_level_kv_indices_tensor,
+            second_level_kv_last_page_len=second_level_kv_last_page_len_tensor,
             second_level_query_start_loc=second_level_query_start_loc,
             block_table_bound=block_table_bound_tensor,
             seq_lens_tensor=seq_lens_tensor,
@@ -1076,13 +1146,9 @@ def unified_flash_infer(
     if decode_meta := attn_metadata.decode_metadata:
         assert attn_metadata.decode_metadata is not None
         if attn_metadata.decode_metadata.cuda_wrapper is not None:
-            decode_output = attn_metadata.decode_metadata.cuda_wrapper.forward(
+            decode_output = attn_metadata.decode_metadata.cuda_wrapper.run(
                 decode_query,
-                kv_cache,
-                sm_scale=softmax_scale,
-                logits_soft_cap=logits_soft_cap,
-                k_scale=k_scale,
-                v_scale=v_scale)
+                kv_cache)
         else:
             assert attn_metadata.decode_metadata.wrapper is not None
             decode_output = attn_metadata.decode_metadata.wrapper.run(
