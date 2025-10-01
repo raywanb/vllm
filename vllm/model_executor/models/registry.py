@@ -76,7 +76,7 @@ _TEXT_GENERATION_MODELS = {
     "Gemma3ForCausalLM": ("gemma3", "Gemma3ForCausalLM"),
     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
-    "Qwen3SwiftKVForCausalLM": ("qwen_gpt_generated", "Qwen3SwiftKVForCausalLM"),
+    "Qwen3SwiftKVForCausalLM": ("qwen3_swiftkv", "Qwen3SwiftKVForCausalLM"),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),

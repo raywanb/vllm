@@ -27,6 +27,7 @@ from vllm.transformers_utils.configs.olmo3 import Olmo3Config
 from vllm.transformers_utils.configs.ovis import OvisConfig
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.transformers_utils.configs.qwen3_swiftkv import Qwen3SwiftKVConfig
+from vllm.transformers_utils.configs.qwen2_swiftkv import Qwen2SwiftKVConfig
 from vllm.transformers_utils.configs.radio import RadioConfig
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.transformers_utils.configs.step3_vl import (Step3TextConfig,
@@ -57,5 +58,6 @@ __all__ = [
     "Step3VisionEncoderConfig",
     "Step3TextConfig",
     "Qwen3NextConfig",
-    "Qwen3SwiftKVConfig"
+    "Qwen3SwiftKVConfig",
+    "Qwen2SwiftKVConfig",
 ]

@@ -1624,7 +1624,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                   model_input.lora_mapping)
 
         self.attn_state.begin_forward(model_input)
-
+        logger.info("model_input.attn_metadata", model_input.attn_metadata)
         # Currently cuda graph is only supported by the decode phase.
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
@@ -1685,6 +1685,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_start.record()
 
         if not bypass_model_exec:
+            logger.info("model_input.attn_metadata", model_input.attn_metadata)
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
                 hidden_or_intermediate_states = model_executable(
