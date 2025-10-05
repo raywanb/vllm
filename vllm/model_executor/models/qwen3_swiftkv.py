@@ -1,51 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+# Copyright 2024 The Qwen team.
+# Copyright 2023 The vLLM team.
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inference-only Qwen3 model compatible with HuggingFace weights."""
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
+from transformers import Qwen3Config
 
-from vllm.forward_context import get_forward_context
-from vllm.attention import AttentionMetadata, AttentionType, Attention
-from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.attention import Attention, AttentionType
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
-from vllm.distributed.parallel_state import graph_capture
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3MLP
-from vllm.model_executor.models.utils import (AutoWeightsLoader,
-                                              extract_layer_index,
-                                              is_pp_missing_parameter,
-                                              maybe_prefix)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3SwiftKVConfig
-from vllm.vllm_flash_attn import (flash_attn_varlen_func,
-                                  flash_attn_with_kvcache)
+
+from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .qwen2 import Qwen2MLP as Qwen3MLP
+from .qwen2 import Qwen2Model
+from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+                    maybe_prefix)
 
 logger = init_logger(__name__)
 
 
-# SwiftKVMetadata not needed - using standard vLLM attention!
-
-
 class Qwen3SwiftKVAttention(nn.Module):
+    """Qwen3Attention with SwiftKV support for weight sharing."""
 
     def __init__(
         self,
@@ -63,9 +72,13 @@ class Qwen3SwiftKVAttention(nn.Module):
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        num_key_value_layers: int = 0,
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_idx = layer_idx
+        self.num_key_value_layers = num_key_value_layers
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -87,22 +100,14 @@ class Qwen3SwiftKVAttention(nn.Module):
         self.rope_theta = rope_theta
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
-        self.q_proj_swiftkv = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=self.total_num_heads * self.head_dim,
-            bias=qkv_bias,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q_proj_swiftkv",
-        )
-        self.kv_proj_swiftkv = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=0,
-            total_num_kv_heads=self.total_num_kv_heads,
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
             bias=qkv_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_proj_swiftkv",
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -120,6 +125,15 @@ class Qwen3SwiftKVAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+        
+        # Determine if this layer should use KV sharing
+        kv_sharing_target_layer_name = None
+        if layer_idx >= num_key_value_layers:
+            # Find the target layer for KV sharing (last layer with its own KV cache)
+            # Use the layer at index (num_key_value_layers - 1) as the target
+            target_layer_idx = num_key_value_layers - 1
+            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+        
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -129,12 +143,12 @@ class Qwen3SwiftKVAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
             **{
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": dual_chunk_attention_config,
             } if dual_chunk_attention_config else {},
         )
-        self.attn_type = attn_type
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -142,74 +156,73 @@ class Qwen3SwiftKVAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        key: Optional[torch.Tensor],
-        value: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        query, _ = self.q_proj_swiftkv(hidden_states)
-        num_tokens, hidden_size = query.shape
-        query = query.view(-1, self.num_heads, self.head_dim)
-        query = self.q_norm(query)
-        dummy_k = torch.empty_like(query[:, :self.num_kv_heads, :])
-        query, _ = self.rotary_emb(positions, query, dummy_k)
-
-        if key is not None:
-            key = key.view(-1, self.num_kv_heads, self.head_dim)
-        if value is not None:
-            value = value.view(-1, self.num_kv_heads, self.head_dim)
-
-        # Use vLLM's optimized attention layer (just like standard Qwen3!)
-        # This handles all the complex KV caching, metadata, and optimization automatically
-        query = query.view(-1, self.num_heads * self.head_dim)
-        if key is not None:
-            key = key.view(-1, self.num_kv_heads * self.head_dim)
-        if value is not None:
-            value = value.view(-1, self.num_kv_heads * self.head_dim)
-            
-        attn_output = self.attn(query, key, value)
-
-        attn_output = attn_output.view(num_tokens, hidden_size)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Add qk-norm
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
+                           self.head_dim)
+        q_by_head = self.q_norm(q_by_head)
+        q = q_by_head.view(q.shape)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
+                           self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        k = k_by_head.view(k.shape)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-
 class Qwen3SwiftKVDecoderLayer(nn.Module):
+    """Qwen3DecoderLayer with SwiftKV support for weight sharing."""
 
     def __init__(
         self,
-        config: Qwen3SwiftKVConfig,
+        config: Qwen3Config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        num_key_value_layers: int = 0,
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        rope_theta = getattr(config, "rope_theta", 1_000_000.0)
+        self.layer_idx = layer_idx
+        self.num_key_value_layers = num_key_value_layers
+        # Requires transformers > 4.32.0
+        rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         dual_chunk_attention_config = getattr(config,
                                               "dual_chunk_attention_config",
                                               None)
-        qkv_bias = getattr(config, "attention_bias", False)
-        head_dim = getattr(config, "head_dim", None)
 
-        attn_type = "decoder"
-        if not getattr(config, "is_causal", True):
-            attn_type = "encoder"
+        # By default, Qwen3 uses causal attention as it is a decoder-only model.
+        # You can override the HF config with `is_causal=False` to enable
+        # bidirectional attention, which is used in some embedding models
+        # (e.g. Alibaba-NLP/gte-Qwen3-7B-instruct)
+        if getattr(config, "is_causal", True):
+            attn_type = AttentionType.DECODER
+        else:
+            attn_type = AttentionType.ENCODER_ONLY
 
         self.self_attn = Qwen3SwiftKVAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=qkv_bias,
+            num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
+            rms_norm_eps=config.rms_norm_eps,
+            qkv_bias=getattr(config, 'attention_bias', False),
+            head_dim=getattr(config, 'head_dim', None),
+            cache_config=cache_config,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
+            rope_scaling=rope_scaling,
             prefix=f"{prefix}.self_attn",
+            attn_type=attn_type,
+            dual_chunk_attention_config=dual_chunk_attention_config,
+            num_key_value_layers=num_key_value_layers,
+            layer_idx=layer_idx,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -227,260 +240,78 @@ class Qwen3SwiftKVDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        k_states: torch.Tensor,
-        v_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            key=k_states,
-            value=v_states,
         )
 
+        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
-def _padded_size(size: int) -> int:
-    mult = (1 << (size - 1).bit_length()) // 4
-    if mult < 1:
-        return size
-    return (size + mult - 1) // mult * mult
+ALL_DECODER_LAYER_TYPES = {
+    "attention": Qwen3SwiftKVDecoderLayer,
+}
 
 
-class Qwen3SwiftKVModel(nn.Module):
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        # positions is of shape (3, seq_len) if mrope is enabled for qwen2-vl,
+        # otherwise (seq_len, ).
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    })
+class Qwen3SwiftKVModel(Qwen2Model):
+    """Qwen3Model with SwiftKV support for weight sharing."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        if not vllm_config.scheduler_config.chunked_prefill_enabled:
-            raise ValueError("SwiftKV requires chunked prefill to be enabled")
-
-        super().__init__()
-
-        config: Qwen3SwiftKVConfig = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        lora_config = vllm_config.lora_config
-
-        self.config = config
-        self.quant_config = quant_config
-        self.key_value_group_size = getattr(config, "key_value_group_size", 1)
-        self.kv_cache_dtype = (cache_config.cache_dtype
-                               if cache_config is not None else "auto")
-
-        lora_vocab = (lora_config.lora_extra_vocab_size *
-                      (lora_config.max_loras or 1)) if lora_config else 0
-        self.vocab_size = config.vocab_size + lora_vocab
-        self.org_vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            quant_config=quant_config,
-        )
-
-        self.layers = torch.nn.ModuleList([
-            Qwen3DecoderLayer(
+        super().__init__(vllm_config=vllm_config,
+                         prefix=prefix,
+                         decoder_layer_type=Qwen3SwiftKVDecoderLayer)
+        
+        # Override the layer creation to pass SwiftKV-specific parameters
+        config = vllm_config.model_config.hf_config
+        self.num_key_value_layers = getattr(config, 'num_key_value_layers', config.num_hidden_layers)
+        
+        # Recreate layers with SwiftKV support
+        self.layers = nn.ModuleList([
+            Qwen3SwiftKVDecoderLayer(
                 config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.layers.{idx}",
-            ) if idx < config.num_key_value_layers else Qwen3SwiftKVDecoderLayer(
-                config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.layers.{idx}",
+                cache_config=vllm_config.cache_config,
+                quant_config=vllm_config.quant_config,
+                prefix=f"{prefix}.layers.{i}",
+                num_key_value_layers=self.num_key_value_layers,
+                layer_idx=i,
             )
-            for idx in range(config.num_hidden_layers)
+            for i in range(config.num_hidden_layers)
         ])
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_swiftkv = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # CUDA graphs handled by standard vLLM attention layers
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
-
-# Metadata conversion not needed - using standard vLLM attention!
-
-    def _run_swiftkv_layers(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        shared_k: torch.Tensor,
-        shared_v: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run SwiftKV layers using shared K,V states for maximum efficiency."""
-        
-        # Process all SwiftKV layers with the same shared K,V
-        for layer_idx in range(self.config.num_key_value_layers,
-                               self.config.num_hidden_layers):
-            layer = self.layers[layer_idx]
-            
-            # All layers use the SAME shared K,V (this is the SwiftKV optimization!)
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                shared_k,  # Same K for all SwiftKV layers
-                shared_v,  # Same V for all SwiftKV layers  
-                residual,
-            )
-            
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if self.config.num_key_value_layers == self.config.num_hidden_layers:
-            raise ValueError("Qwen3SwiftKVConfig requires fewer KV layers than"
-                             " total layers for SwiftKV to be meaningful.")
-
-        # No need for complex metadata handling - vLLM's attention layer handles everything!
-    
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.get_input_embeddings(input_ids)
-        residual = None
-
-        # Process standard layers (with regular attention)
-        for layer_idx in range(self.config.num_key_value_layers):
-            layer = self.layers[layer_idx]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
-
-        # TRUE SwiftKV: Generate shared K,V states ONCE for ALL SwiftKV layers
-        swiftkv_hidden_states = self.norm_swiftkv(hidden_states + residual)
-        
-        # Use the first SwiftKV layer to compute shared K,V (only once!)
-        first_swiftkv_layer = self.layers[self.config.num_key_value_layers]
-        attn = first_swiftkv_layer.self_attn
-        kv, _ = attn.kv_proj_swiftkv(swiftkv_hidden_states)
-        shared_k, shared_v = kv.split(attn.kv_size, dim=-1)
-        
-        # Ensure contiguous memory layout for optimal performance
-        shared_k = shared_k.contiguous().view(-1, attn.num_kv_heads, attn.head_dim)
-        shared_k = attn.k_norm(shared_k)
-        
-        # Apply RoPE to shared K (reuse dummy tensor for efficiency)
-        dummy_q = torch.empty(shared_k.size(0), attn.num_heads, attn.head_dim,
-                             device=shared_k.device, dtype=shared_k.dtype)
-        _, shared_k = attn.rotary_emb(positions, dummy_q, shared_k)
-        shared_v = shared_v.contiguous().view(-1, attn.num_kv_heads, attn.head_dim)
-        
-        # Process SwiftKV layers with shared K,V states (vLLM handles KV caching automatically!)
-        hidden_states = self._run_swiftkv_layers(
-            positions,
-            hidden_states,
-            residual,
-            shared_k,
-            shared_v,
-        )
-
-        return hidden_states
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        for layer_idx in range(self.config.num_key_value_layers):
-            prefix = f".{layer_idx}.self_attn"
-            stacked_params_mapping.extend([
-                (f"{prefix}.qkv_proj", f"{prefix}.q_proj", "q"),
-                (f"{prefix}.qkv_proj", f"{prefix}.k_proj", "k"),
-                (f"{prefix}.qkv_proj", f"{prefix}.v_proj", "v"),
-            ])
-        for layer_idx in range(self.config.num_key_value_layers,
-                               self.config.num_hidden_layers):
-            prefix = f".{layer_idx}.self_attn"
-            stacked_params_mapping.extend([
-                (f"{prefix}.kv_proj_swiftkv", f"{prefix}.k_proj_swiftkv", "k"),
-                (f"{prefix}.kv_proj_swiftkv", f"{prefix}.v_proj_swiftkv", "v"),
-            ])
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            orig_name = name
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if ("rotary_emb.cos_cached" in name
-                    or "rotary_emb.sin_cached" in name):
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if name not in params_dict:
-                    logger.warning("Skip loading %s", orig_name)
-                    break
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                if name not in params_dict:
-                    logger.warning("Skip loading %s", orig_name)
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        pass
-
-
-class Qwen3SwiftKVForCausalLM(nn.Module):
+class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {
-        "kv_proj_swiftkv": ["k_proj_swiftkv", "v_proj_swiftkv"],
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
-    column_parallel_weights_modules = [
-        ".q_proj_swiftkv.",
-        ".down_proj.",
-        ".o_proj.",
-    ]
-
-    bitsandbytes_stacked_params_mapping = {
-        "k_proj_swiftkv": ("kv_proj_swiftkv", 1),
-        "v_proj_swiftkv": ("kv_proj_swiftkv", 2),
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -492,31 +323,36 @@ class Qwen3SwiftKVForCausalLM(nn.Module):
         self.config = config
         self.lora_config = lora_config
 
-        self.model = Qwen3SwiftKVModel(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-        )
+        self.quant_config = quant_config
+        self.model = Qwen3Model(vllm_config=vllm_config,
+                                prefix=maybe_prefix(prefix, "model"))
 
-        self.unpadded_vocab_size = config.vocab_size
-        if lora_config:
-            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(config.vocab_size,
+                                              config.hidden_size,
+                                              quant_config=quant_config,
+                                              prefix=maybe_prefix(
+                                                  prefix, "lm_head"))
+        else:
+            self.lm_head = PPMissingLayer()
 
-        self.lm_head = ParallelLMHead(
-            self.unpadded_vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=(DEFAULT_VOCAB_PADDING_SIZE
-                          if not lora_config else
-                          lora_config.lora_vocab_padding_size),
-            quant_config=quant_config,
-        )
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
-        logit_scale = getattr(config, "logit_scale", 1.0)
-        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
-                                                config.vocab_size, logit_scale)
-        self.sampler = Sampler()
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -525,10 +361,9 @@ class Qwen3SwiftKVForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        return self.model(input_ids,
-                          positions,
-                          intermediate_tensors,
-                          inputs_embeds)
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
+        return hidden_states
 
     def compute_logits(
         self,
@@ -539,21 +374,141 @@ class Qwen3SwiftKVForCausalLM(nn.Module):
                                        sampling_metadata)
         return logits
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(logits, sampling_metadata)
-        return next_tokens
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        loader.load_weights(weights)
+        return loader.load_weights(weights)
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
+
+class Qwen3SwiftKVForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj", 
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
+
+        self.config = config
+        self.lora_config = lora_config
+        self.quant_config = quant_config
+        
+        # Store SwiftKV specific config
+        self.num_key_value_layers = getattr(config, 'num_key_value_layers', config.num_hidden_layers)
+        self.swiftkv_enabled = getattr(config, 'swiftkv', False)
+        
+        self.model = Qwen3SwiftKVModel(vllm_config=vllm_config,
+                                       prefix=maybe_prefix(prefix, "model"))
+
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(config.vocab_size,
+                                              config.hidden_size,
+                                              quant_config=quant_config,
+                                              prefix=maybe_prefix(
+                                                  prefix, "lm_head"))
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds)
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        """Load weights with SwiftKV weight mapping for layers >= num_key_value_layers."""
+        loaded_params = set()
+        
+        # Create a mapping for SwiftKV weights
+        swiftkv_weight_mapping = {}
+        
+        for name, weight in weights:
+            # Check if this is a SwiftKV weight for layers beyond num_key_value_layers
+            if self.swiftkv_enabled and any(swiftkv_suffix in name for swiftkv_suffix in 
+                                          ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
+                                           'q_norm_swiftkv', 'k_norm_swiftkv']):
+                # Extract layer index from the weight name
+                # Expected format: model.layers.{layer_idx}.self_attn.{weight_name}_swiftkv
+                parts = name.split('.')
+                if len(parts) >= 4 and parts[0] == 'model' and parts[1] == 'layers':
+                    try:
+                        layer_idx = int(parts[2])
+                        if layer_idx >= self.num_key_value_layers:
+                            # Map SwiftKV weights to regular Qwen3 attention weights
+                            if 'q_proj_swiftkv' in name:
+                                mapped_name = name.replace('q_proj_swiftkv', 'qkv_proj')
+                            elif 'k_proj_swiftkv' in name:
+                                mapped_name = name.replace('k_proj_swiftkv', 'qkv_proj')
+                            elif 'v_proj_swiftkv' in name:
+                                mapped_name = name.replace('v_proj_swiftkv', 'qkv_proj')
+                            elif 'q_norm_swiftkv' in name:
+                                mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
+                            elif 'k_norm_swiftkv' in name:
+                                mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
+                            else:
+                                mapped_name = name
+                            
+                            swiftkv_weight_mapping[mapped_name] = weight
+                            continue
+                    except (ValueError, IndexError):
+                        pass
+            
+            # For non-SwiftKV weights or layers < num_key_value_layers, load normally
+            swiftkv_weight_mapping[name] = weight
+        
+        # Use AutoWeightsLoader with the mapped weights
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."]
+                           if self.config.tie_word_embeddings else None),
+        )
+        loaded_params = loader.load_weights(swiftkv_weight_mapping.items())
+        
+        return loaded_params
