@@ -40,14 +40,14 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding, DEFAULT_VOCAB_PADDING_SIZE
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
-from .qwen2 import Qwen2MLP as Qwen3MLP
-from .qwen2 import Qwen2Model
+from .qwen2 import Qwen2MLP as Qwen3MLP, Qwen2Model
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+                    make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
 logger = init_logger(__name__)
@@ -74,6 +74,7 @@ class Qwen3SwiftKVAttention(nn.Module):
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         num_key_value_layers: int = 0,
         layer_idx: int = 0,
+        kv_sharing_map: Optional[dict[int, int]] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -128,12 +129,21 @@ class Qwen3SwiftKVAttention(nn.Module):
         
         # Determine if this layer should use KV sharing
         kv_sharing_target_layer_name = None
-        if layer_idx >= num_key_value_layers:
-            # Find the target layer for KV sharing (last layer with its own KV cache)
-            # Use the layer at index (num_key_value_layers - 1) as the target
-            target_layer_idx = num_key_value_layers - 1
-            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+        if layer_idx >= num_key_value_layers and layer_idx > 0:
+            # Check if there's a custom kv_sharing_map
+            if kv_sharing_map and layer_idx in kv_sharing_map:
+                # Use custom kv_sharing_map if available
+                logger.info(f"Layer{layer_idx} is sharing KV with Layer{kv_sharing_map[layer_idx]}")
+                target_layer_idx = kv_sharing_map[layer_idx]
+                kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+            else:
+                
+                # Fall back to simple pattern: use the layer at index (num_key_value_layers - 1)
+                target_layer_idx = num_key_value_layers - 1
+                kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
         
+        logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
+        logger.info(f"prefix: {prefix}.attn")
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -185,6 +195,7 @@ class Qwen3SwiftKVDecoderLayer(nn.Module):
         prefix: str = "",
         num_key_value_layers: int = 0,
         layer_idx: int = 0,
+        kv_sharing_map: Optional[dict[int, int]] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -223,6 +234,7 @@ class Qwen3SwiftKVDecoderLayer(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
             num_key_value_layers=num_key_value_layers,
             layer_idx=layer_idx,
+            kv_sharing_map=kv_sharing_map,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -279,26 +291,114 @@ class Qwen3SwiftKVModel(Qwen2Model):
     """Qwen3Model with SwiftKV support for weight sharing."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config,
-                         prefix=prefix,
-                         decoder_layer_type=Qwen3SwiftKVDecoderLayer)
+        # Initialize the base model without creating layers yet
+        super(Qwen2Model, self).__init__()
         
-        # Override the layer creation to pass SwiftKV-specific parameters
         config = vllm_config.model_config.hf_config
-        self.num_key_value_layers = getattr(config, 'num_key_value_layers', config.num_hidden_layers)
+        self.config = config
+        self.cache_config = vllm_config.cache_config
+        self.quant_config = vllm_config.quant_config
         
-        # Recreate layers with SwiftKV support
-        self.layers = nn.ModuleList([
-            Qwen3SwiftKVDecoderLayer(
+        # Store SwiftKV-specific parameters
+        self.num_key_value_layers = getattr(config, 'num_key_value_layers', config.num_hidden_layers)
+        self.kv_sharing_map = getattr(config, 'kv_sharing_map', {})
+        
+        # Initialize the embedding layer
+        if get_pp_group().is_first_rank or (config.tie_word_embeddings
+                                            and get_pp_group().is_last_rank):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        
+        # Create SwiftKV layers with custom kv_sharing_map and pipeline parallelism support
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: Qwen3SwiftKVDecoderLayer(
                 config=config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
-                prefix=f"{prefix}.layers.{i}",
+                prefix=prefix,
                 num_key_value_layers=self.num_key_value_layers,
-                layer_idx=i,
-            )
-            for i in range(config.num_hidden_layers)
-        ])
+                layer_idx=int(prefix.split('.')[-1]),  # Extract layer index from prefix
+                kv_sharing_map=self.kv_sharing_map,
+            ),
+            prefix=f"{prefix}.layers",
+        )
+        
+        # Initialize the norm layer with pipeline parallelism support
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+            
+        # Initialize intermediate tensors factory
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
+        
+        # Initialize aux hidden state layers
+        self.aux_hidden_state_layers = tuple[int, ...]()
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        """Load weights with SwiftKV weight mapping for layers >= num_key_value_layers."""
+        # Create a mapping for SwiftKV weights
+        swiftkv_weight_mapping = {}
+        
+        for name, weight in weights:
+            # Check if this is a SwiftKV weight for layers beyond num_key_value_layers
+            if any(swiftkv_suffix in name for swiftkv_suffix in 
+                   ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
+                    'q_norm_swiftkv', 'k_norm_swiftkv', 'norm_swiftkv']):
+                # Extract layer index from the weight name
+                # Handle path formats:
+                # 2. layers.{layer_idx}.self_attn.{weight_name}_swiftkv  
+                # 3. {weight_name}_swiftkv (for norm layers at model level)
+                parts = name.split('.')
+                layer_idx = None
+                
+                # Try to extract layer index from path format 2
+                if len(parts) >= 3 and parts[0] == 'layers':
+                    try:
+                        layer_idx = int(parts[1])
+                    except (ValueError, IndexError):
+                        pass
+                
+                # If we found a layer index and it's >= num_key_value_layers, map the weight
+                # OR if it's a model-level norm weight (no layer index), always map it
+                if (layer_idx is not None and layer_idx >= self.num_key_value_layers) or layer_idx is None:
+                    # Map SwiftKV weights to regular Qwen3 attention weights
+                    if 'q_proj_swiftkv' in name:
+                        mapped_name = name.replace('q_proj_swiftkv', 'q_proj')
+                    elif 'k_proj_swiftkv' in name:
+                        mapped_name = name.replace('k_proj_swiftkv', 'k_proj')
+                    elif 'v_proj_swiftkv' in name:
+                        mapped_name = name.replace('v_proj_swiftkv', 'v_proj')
+                    elif 'q_norm_swiftkv' in name:
+                        mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
+                    elif 'k_norm_swiftkv' in name:
+                        mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
+                    elif 'norm_swiftkv' in name:
+                        mapped_name = name.replace('norm_swiftkv', 'norm')
+                    else:
+                        mapped_name = name
+                    
+                    swiftkv_weight_mapping[mapped_name] = weight
+                    continue
+            
+            # For non-SwiftKV weights or layers < num_key_value_layers, load normally
+            swiftkv_weight_mapping[name] = weight
+        
+        logger.info(f"swiftkv_weight_mapping: {swiftkv_weight_mapping.keys()}")
+        # Call parent's load_weights method with the mapped weights
+        return super().load_weights(swiftkv_weight_mapping.items())
 
 
 class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
@@ -324,8 +424,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.lora_config = lora_config
 
         self.quant_config = quant_config
-        self.model = Qwen3Model(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
+        self.model = Qwen3SwiftKVModel(vllm_config=vllm_config,
+                                       prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -463,52 +563,9 @@ class Qwen3SwiftKVForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        """Load weights with SwiftKV weight mapping for layers >= num_key_value_layers."""
-        loaded_params = set()
-        
-        # Create a mapping for SwiftKV weights
-        swiftkv_weight_mapping = {}
-        
-        for name, weight in weights:
-            # Check if this is a SwiftKV weight for layers beyond num_key_value_layers
-            if self.swiftkv_enabled and any(swiftkv_suffix in name for swiftkv_suffix in 
-                                          ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
-                                           'q_norm_swiftkv', 'k_norm_swiftkv']):
-                # Extract layer index from the weight name
-                # Expected format: model.layers.{layer_idx}.self_attn.{weight_name}_swiftkv
-                parts = name.split('.')
-                if len(parts) >= 4 and parts[0] == 'model' and parts[1] == 'layers':
-                    try:
-                        layer_idx = int(parts[2])
-                        if layer_idx >= self.num_key_value_layers:
-                            # Map SwiftKV weights to regular Qwen3 attention weights
-                            if 'q_proj_swiftkv' in name:
-                                mapped_name = name.replace('q_proj_swiftkv', 'qkv_proj')
-                            elif 'k_proj_swiftkv' in name:
-                                mapped_name = name.replace('k_proj_swiftkv', 'qkv_proj')
-                            elif 'v_proj_swiftkv' in name:
-                                mapped_name = name.replace('v_proj_swiftkv', 'qkv_proj')
-                            elif 'q_norm_swiftkv' in name:
-                                mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
-                            elif 'k_norm_swiftkv' in name:
-                                mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
-                            else:
-                                mapped_name = name
-                            
-                            swiftkv_weight_mapping[mapped_name] = weight
-                            continue
-                    except (ValueError, IndexError):
-                        pass
-            
-            # For non-SwiftKV weights or layers < num_key_value_layers, load normally
-            swiftkv_weight_mapping[name] = weight
-        
-        # Use AutoWeightsLoader with the mapped weights
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        loaded_params = loader.load_weights(swiftkv_weight_mapping.items())
-        
-        return loaded_params
+        return loader.load_weights(weights)
