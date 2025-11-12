@@ -193,6 +193,14 @@ class LlamaAttention(nn.Module):
         attn_cls = (EncoderOnlyAttention
                     if attn_type == AttentionType.ENCODER_ONLY else Attention)
 
+        kv_sharing_target_layer_name = None
+        kv_sharing_map = {}
+
+        if kv_sharing_map and layer_idx in kv_sharing_map:
+            # Use kv_sharing_map for flexible KV sharing
+            target_layer_idx = kv_sharing_map[layer_idx]
+            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+
         self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
@@ -201,6 +209,7 @@ class LlamaAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )

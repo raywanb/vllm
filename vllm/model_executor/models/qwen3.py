@@ -120,6 +120,22 @@ class Qwen3Attention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+
+        # kv_sharing_map = None
+        # kv_sharing_target_layer_idx = None
+        # layer_idx = extract_layer_index(prefix)
+        # logger.info(f"layer_idx: {layer_idx}")
+        # # self.layer_idx = layer_idx
+        # # if layer_idx >= 30 and layer_idx > 0:
+        # #     logger.info(f"Layer{layer_idx} is sharing KV with Layer 29")
+        # #     kv_sharing_target_layer_name = f"model.layers.29.self_attn.attn"
+        # if kv_sharing_map and layer_idx in kv_sharing_map:
+        #     # Use kv_sharing_map for flexible KV sharing
+        #     target_layer_idx = kv_sharing_map[layer_idx]
+        #     kv_sharing_target_layer_idx = f"model.layers.{target_layer_idx}.self_attn.attn"
+        #     logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
+
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,

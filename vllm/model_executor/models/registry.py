@@ -103,6 +103,7 @@ _TEXT_GENERATION_MODELS = {
     "Lfm2ForCausalLM": ("lfm2", "Lfm2ForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
     "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),  # noqa: E501
+    "LlamaSwiftKVForCausalLM": ("llama_swiftkv", "LlamaSwiftKVForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
     "MambaForCausalLM": ("mamba", "MambaForCausalLM"),

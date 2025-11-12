@@ -1,10 +1,16 @@
 from typing import Dict, Optional
 
-from transformers import Qwen2Config
+from transformers import LlamaConfig
 
 
-class Qwen2SwiftKVConfig(Qwen2Config):
+class LlamaSwiftKVConfig(LlamaConfig):
     """
+    Configuration class for Llama models with SwiftKV support.
+    
+    SwiftKV enables KV cache sharing across layers, reducing memory usage
+    and computation. Layers specified in kv_sharing_map will reuse KV caches
+    from other layers and use separate q_proj_swiftkv weights for queries.
+    
     Args:
         swiftkv (bool, optional):
             Whether to enable SwiftKV mode. Defaults to False.
@@ -14,25 +20,16 @@ class Qwen2SwiftKVConfig(Qwen2Config):
         kv_sharing_map (Dict[int, int], optional):
             Mapping from layer index to the layer index whose KV cache should be used.
             If provided, this overrides the simple num_key_value_layers behavior.
-        mlp_tuning_enabled (bool, optional):
-            Whether to enable separate trainable MLP projections for layers that share KV cache.
-            When enabled, consumer layers will have separate gate_proj_swiftkv, up_proj_swiftkv,
-            and down_proj_swiftkv parameters. Defaults to True for backward compatibility.
-        layernorm_tuning_enabled (bool, optional):
-            Whether to enable separate trainable layer norms for layers that share KV cache.
-            When enabled, consumer layers will have separate input_layernorm_swiftkv and
-            post_attention_layernorm_swiftkv parameters. Defaults to False.
+            Example: {4: 0, 5: 1} means layer 4 uses KV from layer 0, layer 5 uses KV from layer 1.
     """
 
-    model_type = "qwen2_swiftkv"
+    model_type = "llama_swiftkv"
 
     def __init__(
         self,
         swiftkv: bool = False,
         num_key_value_layers: Optional[int] = None,
         kv_sharing_map: Optional[Dict[int, int]] = None,
-        mlp_tuning_enabled: bool = True,
-        layernorm_tuning_enabled: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -40,5 +37,5 @@ class Qwen2SwiftKVConfig(Qwen2Config):
         self.num_key_value_layers = (num_key_value_layers
                                      or self.num_hidden_layers)
         self.kv_sharing_map = kv_sharing_map or {}
-        self.mlp_tuning_enabled = mlp_tuning_enabled
-        self.layernorm_tuning_enabled = layernorm_tuning_enabled
+
+

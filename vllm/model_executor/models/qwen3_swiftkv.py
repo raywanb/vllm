@@ -127,20 +127,14 @@ class Qwen3SwiftKVAttention(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         
-        # Determine if this layer should use KV sharing
+        # Determine if this layer should use KV sharing based on kv_sharing_map
         kv_sharing_target_layer_name = None
-        if layer_idx >= num_key_value_layers and layer_idx > 0:
-            # Check if there's a custom kv_sharing_map
-            if kv_sharing_map and layer_idx in kv_sharing_map:
-                # Use custom kv_sharing_map if available
-                logger.info(f"Layer{layer_idx} is sharing KV with Layer{kv_sharing_map[layer_idx]}")
-                target_layer_idx = kv_sharing_map[layer_idx]
-                kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
-            else:
-                
-                # Fall back to simple pattern: use the layer at index (num_key_value_layers - 1)
-                target_layer_idx = num_key_value_layers - 1
-                kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+        print("kv_sharing_map", kv_sharing_map)
+        if kv_sharing_map and layer_idx in kv_sharing_map:
+            # Use kv_sharing_map for flexible KV sharing
+            target_layer_idx = kv_sharing_map[layer_idx]
+            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+            logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
         
         logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
         logger.info(f"prefix: {prefix}.attn")
@@ -302,6 +296,9 @@ class Qwen3SwiftKVModel(Qwen2Model):
         # Store SwiftKV-specific parameters
         self.num_key_value_layers = getattr(config, 'num_key_value_layers', config.num_hidden_layers)
         self.kv_sharing_map = getattr(config, 'kv_sharing_map', {})
+
+        ## convert kv_sharing_map to key: value to int mapping
+        self.kv_sharing_map = {int(key): int(value) for key, value in self.kv_sharing_map.items()}
         
         # Initialize the embedding layer
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
@@ -356,7 +353,8 @@ class Qwen3SwiftKVModel(Qwen2Model):
             # Check if this is a SwiftKV weight for layers beyond num_key_value_layers
             if any(swiftkv_suffix in name for swiftkv_suffix in 
                    ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
-                    'q_norm_swiftkv', 'k_norm_swiftkv', 'norm_swiftkv']):
+                    'q_norm_swiftkv', 'k_norm_swiftkv', 'norm_swiftkv',
+                    'gate_proj_swiftkv', 'up_proj_swiftkv', 'down_proj_swiftkv']):
                 # Extract layer index from the weight name
                 # Handle path formats:
                 # 2. layers.{layer_idx}.self_attn.{weight_name}_swiftkv  
@@ -371,9 +369,9 @@ class Qwen3SwiftKVModel(Qwen2Model):
                     except (ValueError, IndexError):
                         pass
                 
-                # If we found a layer index and it's >= num_key_value_layers, map the weight
+                # If we found a layer index and it's a consumer layer in kv_sharing_map, map the weight
                 # OR if it's a model-level norm weight (no layer index), always map it
-                if (layer_idx is not None and layer_idx >= self.num_key_value_layers) or layer_idx is None:
+                if (layer_idx is not None and layer_idx in self.kv_sharing_map) or layer_idx is None:
                     # Map SwiftKV weights to regular Qwen3 attention weights
                     if 'q_proj_swiftkv' in name:
                         mapped_name = name.replace('q_proj_swiftkv', 'q_proj')
@@ -387,13 +385,22 @@ class Qwen3SwiftKVModel(Qwen2Model):
                         mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
                     elif 'norm_swiftkv' in name:
                         mapped_name = name.replace('norm_swiftkv', 'norm')
+                    elif 'gate_proj_swiftkv' in name:
+                        mapped_name = name.replace('gate_proj_swiftkv', 'gate_proj')
+                    elif 'up_proj_swiftkv' in name:
+                        mapped_name = name.replace('up_proj_swiftkv', 'up_proj')
+                    elif 'down_proj_swiftkv' in name:
+                        mapped_name = name.replace('down_proj_swiftkv', 'down_proj')
                     else:
                         mapped_name = name
                     
                     swiftkv_weight_mapping[mapped_name] = weight
-                    continue
+                else:
+                    # Skip SwiftKV weights for layers that are not consumers
+                    logger.info(f"Skipping SwiftKV weight for non-consumer layer: {name}")
+                continue
             
-            # For non-SwiftKV weights or layers < num_key_value_layers, load normally
+            # For non-SwiftKV weights, load normally
             swiftkv_weight_mapping[name] = weight
         
         logger.info(f"swiftkv_weight_mapping: {swiftkv_weight_mapping.keys()}")
