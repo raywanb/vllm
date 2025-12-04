@@ -27,6 +27,7 @@ from typing import Any, Optional, Union
 
 import torch
 from torch import nn
+from torch.nn.parameter import Parameter
 from transformers import Qwen3Config
 
 from vllm.attention import Attention, AttentionType
@@ -36,7 +37,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
-                                               RowParallelLinear)
+                                               RowParallelLinear, ColumnParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -52,6 +53,21 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
 
 logger = init_logger(__name__)
 
+class ConsumerQKVLinear(ColumnParallelLinear):
+    """
+    Specialized Linear layer for consumer layers in SwiftKV.
+    It only loads/computes the Query (Q) projection and ignores K and V.
+    """
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: Optional[str] = None):
+        # Only load weights for Query ("q")
+        if loaded_shard_id == "q":
+            super().weight_loader(param, loaded_weight)
+        elif loaded_shard_id in ["k", "v"]:
+            # Ignore K and V weights as we don't allocate memory for them
+            pass
+        else:
+            # Fallback for other cases (e.g. bias if applicable, though usually None for Qwen)
+            super().weight_loader(param, loaded_weight)
 
 class Qwen3SwiftKVAttention(nn.Module):
     """Qwen3Attention with SwiftKV support for weight sharing."""
@@ -101,15 +117,41 @@ class Qwen3SwiftKVAttention(nn.Module):
         self.rope_theta = rope_theta
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
+        # Determine if this layer should use KV sharing based on kv_sharing_map
+        kv_sharing_target_layer_name = None
+        self.is_consumer_layer = False
+        print("kv_sharing_map", kv_sharing_map)
+
+        if kv_sharing_map and layer_idx in kv_sharing_map:
+            # Use kv_sharing_map for flexible KV sharing
+            target_layer_idx = kv_sharing_map[layer_idx]
+            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
+            self.is_consumer_layer = True
+            logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
+        
+        logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
+        logger.info(f"prefix: {prefix}.attn")
+
+        if self.is_consumer_layer:
+             # Use ConsumerQKVLinear for just Q projection
+             self.qkv_proj = ConsumerQKVLinear(
+                 hidden_size,
+                 self.total_num_heads * self.head_dim,
+                 bias=qkv_bias,
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.qkv_proj",
+             )
+        else:
+             self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -127,17 +169,6 @@ class Qwen3SwiftKVAttention(nn.Module):
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         
-        # Determine if this layer should use KV sharing based on kv_sharing_map
-        kv_sharing_target_layer_name = None
-        print("kv_sharing_map", kv_sharing_map)
-        if kv_sharing_map and layer_idx in kv_sharing_map:
-            # Use kv_sharing_map for flexible KV sharing
-            target_layer_idx = kv_sharing_map[layer_idx]
-            kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
-            logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
-        
-        logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
-        logger.info(f"prefix: {prefix}.attn")
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -154,25 +185,45 @@ class Qwen3SwiftKVAttention(nn.Module):
             } if dual_chunk_attention_config else {},
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        if not self.is_consumer_layer:
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        else:
+            self.k_norm = None
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
-                           self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
-                           self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        if self.is_consumer_layer:
+            # For consumer layers, we only compute Q.
+            qkv, _ = self.qkv_proj(hidden_states)
+            q = qkv
+            k = None
+            v = None
+            
+            # Add q-norm
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
+                               self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            
+            # Apply rotary embedding only to q (k is None)
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
+                               self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
+                               self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+            q, k = self.rotary_emb(positions, q, k)
+            
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -350,60 +401,56 @@ class Qwen3SwiftKVModel(Qwen2Model):
         swiftkv_weight_mapping = {}
         
         for name, weight in weights:
-            # Check if this is a SwiftKV weight for layers beyond num_key_value_layers
+            # Extract layer index from the weight name
+            # Common patterns: layers.{idx}.self_attn...
+            parts = name.split('.')
+            layer_idx = None
+            for part in parts:
+                if part.isdigit():
+                    layer_idx = int(part)
+                    break
+            
+            # Filter out K/V weights for consumer layers
+            if layer_idx is not None and layer_idx in self.kv_sharing_map:
+                if 'k_proj' in name or 'v_proj' in name or 'k_norm' in name:
+                    # Skip loading these weights
+                    continue
+
+            # Check if this is a SwiftKV weight
             if any(swiftkv_suffix in name for swiftkv_suffix in 
                    ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
                     'q_norm_swiftkv', 'k_norm_swiftkv', 'norm_swiftkv',
                     'gate_proj_swiftkv', 'up_proj_swiftkv', 'down_proj_swiftkv']):
-                # Extract layer index from the weight name
-                # Handle path formats:
-                # 2. layers.{layer_idx}.self_attn.{weight_name}_swiftkv  
-                # 3. {weight_name}_swiftkv (for norm layers at model level)
-                parts = name.split('.')
-                layer_idx = None
                 
-                # Try to extract layer index from path format 2
-                if len(parts) >= 3 and parts[0] == 'layers':
-                    try:
-                        layer_idx = int(parts[1])
-                    except (ValueError, IndexError):
-                        pass
-                
-                # If we found a layer index and it's a consumer layer in kv_sharing_map, map the weight
-                # OR if it's a model-level norm weight (no layer index), always map it
-                if (layer_idx is not None and layer_idx in self.kv_sharing_map) or layer_idx is None:
-                    # Map SwiftKV weights to regular Qwen3 attention weights
-                    if 'q_proj_swiftkv' in name:
-                        mapped_name = name.replace('q_proj_swiftkv', 'q_proj')
-                    elif 'k_proj_swiftkv' in name:
-                        mapped_name = name.replace('k_proj_swiftkv', 'k_proj')
-                    elif 'v_proj_swiftkv' in name:
-                        mapped_name = name.replace('v_proj_swiftkv', 'v_proj')
-                    elif 'q_norm_swiftkv' in name:
-                        mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
-                    elif 'k_norm_swiftkv' in name:
-                        mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
-                    elif 'norm_swiftkv' in name:
-                        mapped_name = name.replace('norm_swiftkv', 'norm')
-                    elif 'gate_proj_swiftkv' in name:
-                        mapped_name = name.replace('gate_proj_swiftkv', 'gate_proj')
-                    elif 'up_proj_swiftkv' in name:
-                        mapped_name = name.replace('up_proj_swiftkv', 'up_proj')
-                    elif 'down_proj_swiftkv' in name:
-                        mapped_name = name.replace('down_proj_swiftkv', 'down_proj')
-                    else:
-                        mapped_name = name
-                    
-                    swiftkv_weight_mapping[mapped_name] = weight
+                # Map SwiftKV weights to regular Qwen3 attention weights
+                if 'q_proj_swiftkv' in name:
+                    mapped_name = name.replace('q_proj_swiftkv', 'q_proj')
+                elif 'k_proj_swiftkv' in name:
+                    mapped_name = name.replace('k_proj_swiftkv', 'k_proj')
+                elif 'v_proj_swiftkv' in name:
+                    mapped_name = name.replace('v_proj_swiftkv', 'v_proj')
+                elif 'q_norm_swiftkv' in name:
+                    mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
+                elif 'k_norm_swiftkv' in name:
+                    mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
+                elif 'norm_swiftkv' in name:
+                    mapped_name = name.replace('norm_swiftkv', 'norm')
+                elif 'gate_proj_swiftkv' in name:
+                    mapped_name = name.replace('gate_proj_swiftkv', 'gate_proj')
+                elif 'up_proj_swiftkv' in name:
+                    mapped_name = name.replace('up_proj_swiftkv', 'up_proj')
+                elif 'down_proj_swiftkv' in name:
+                    mapped_name = name.replace('down_proj_swiftkv', 'down_proj')
                 else:
-                    # Skip SwiftKV weights for layers that are not consumers
-                    logger.info(f"Skipping SwiftKV weight for non-consumer layer: {name}")
+                    mapped_name = name
+                
+                swiftkv_weight_mapping[mapped_name] = weight
                 continue
             
             # For non-SwiftKV weights, load normally
             swiftkv_weight_mapping[name] = weight
         
-        logger.info(f"swiftkv_weight_mapping: {swiftkv_weight_mapping.keys()}")
+        logger.info(f"swiftkv_weight_mapping keys: {list(swiftkv_weight_mapping.keys())}")
         # Call parent's load_weights method with the mapped weights
         return super().load_weights(swiftkv_weight_mapping.items())
 
