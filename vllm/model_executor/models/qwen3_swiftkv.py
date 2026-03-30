@@ -417,33 +417,8 @@ class Qwen3SwiftKVModel(Qwen2Model):
                     continue
 
             # Check if this is a SwiftKV weight
-            if any(swiftkv_suffix in name for swiftkv_suffix in 
-                   ['q_proj_swiftkv', 'k_proj_swiftkv', 'v_proj_swiftkv', 
-                    'q_norm_swiftkv', 'k_norm_swiftkv', 'norm_swiftkv',
-                    'gate_proj_swiftkv', 'up_proj_swiftkv', 'down_proj_swiftkv']):
-                
-                # Map SwiftKV weights to regular Qwen3 attention weights
-                if 'q_proj_swiftkv' in name:
-                    mapped_name = name.replace('q_proj_swiftkv', 'q_proj')
-                elif 'k_proj_swiftkv' in name:
-                    mapped_name = name.replace('k_proj_swiftkv', 'k_proj')
-                elif 'v_proj_swiftkv' in name:
-                    mapped_name = name.replace('v_proj_swiftkv', 'v_proj')
-                elif 'q_norm_swiftkv' in name:
-                    mapped_name = name.replace('q_norm_swiftkv', 'q_norm')
-                elif 'k_norm_swiftkv' in name:
-                    mapped_name = name.replace('k_norm_swiftkv', 'k_norm')
-                elif 'norm_swiftkv' in name:
-                    mapped_name = name.replace('norm_swiftkv', 'norm')
-                elif 'gate_proj_swiftkv' in name:
-                    mapped_name = name.replace('gate_proj_swiftkv', 'gate_proj')
-                elif 'up_proj_swiftkv' in name:
-                    mapped_name = name.replace('up_proj_swiftkv', 'up_proj')
-                elif 'down_proj_swiftkv' in name:
-                    mapped_name = name.replace('down_proj_swiftkv', 'down_proj')
-                else:
-                    mapped_name = name
-                
+            if '_swiftkv' in name:
+                mapped_name = name.replace('_swiftkv', '')
                 swiftkv_weight_mapping[mapped_name] = weight
                 continue
             
