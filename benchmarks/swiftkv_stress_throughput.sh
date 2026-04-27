@@ -22,6 +22,9 @@
 #   MAX_MODEL_LEN         default 8192
 #   KV_CACHE_MEMORY_BYTES unset = auto from gpu_memory_utilization; set to pin KV pool
 #
+# FlashInfer (pip: flashinfer-python, flashinfer-cubin): ensure writable caches.
+# Override with FLASHINFER_CACHE_DIR / CUTE_DSL_CACHE_DIR / TMPDIR if needed.
+#
 set -euo pipefail
 
 MODEL="${1:?Usage: $0 <model_path_or_hf_id>}"
@@ -48,6 +51,11 @@ if [[ -n "${KV_CACHE_MEMORY_BYTES:-}" ]]; then
 fi
 
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+
+_CACHE_ROOT="${XDG_CACHE_HOME:-${HOME:-.}/.cache}"
+export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-${_CACHE_ROOT}/flashinfer}"
+export CUTE_DSL_CACHE_DIR="${CUTE_DSL_CACHE_DIR:-${_CACHE_ROOT}/cutlass_dsl}"
+mkdir -p "${FLASHINFER_CACHE_DIR}" "${CUTE_DSL_CACHE_DIR}"
 
 echo "[swiftkv_stress_throughput] repo: ${REPO_ROOT}"
 echo "[swiftkv_stress_throughput] model: ${MODEL}"
