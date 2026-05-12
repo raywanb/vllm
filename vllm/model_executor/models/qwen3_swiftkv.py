@@ -120,17 +120,16 @@ class Qwen3SwiftKVAttention(nn.Module):
         # Determine if this layer should use KV sharing based on kv_sharing_map
         kv_sharing_target_layer_name = None
         self.is_consumer_layer = False
-        print("kv_sharing_map", kv_sharing_map)
 
         if kv_sharing_map and layer_idx in kv_sharing_map:
             # Use kv_sharing_map for flexible KV sharing
             target_layer_idx = kv_sharing_map[layer_idx]
             kv_sharing_target_layer_name = f"model.layers.{target_layer_idx}.self_attn.attn"
             self.is_consumer_layer = True
-            logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
+        #     logger.info(f"Layer {layer_idx} is sharing KV with Layer {target_layer_idx}")
         
-        logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
-        logger.info(f"prefix: {prefix}.attn")
+        # logger.info(f"kv_sharing_target_layer_name: {kv_sharing_target_layer_name}")
+        # logger.info(f"prefix: {prefix}.attn")
 
         if self.is_consumer_layer:
              # Use ConsumerQKVLinear for just Q projection
@@ -197,8 +196,7 @@ class Qwen3SwiftKVAttention(nn.Module):
     ) -> torch.Tensor:
         if self.is_consumer_layer:
             # For consumer layers, we only compute Q.
-            qkv, _ = self.qkv_proj(hidden_states)
-            q = qkv
+            q, _ = self.qkv_proj(hidden_states)
             k = None
             v = None
             
@@ -425,7 +423,8 @@ class Qwen3SwiftKVModel(Qwen2Model):
             # For non-SwiftKV weights, load normally
             swiftkv_weight_mapping[name] = weight
         
-        logger.info(f"swiftkv_weight_mapping keys: {list(swiftkv_weight_mapping.keys())}")
+        logger.debug("swiftkv_weight_mapping: loaded %d weights",
+                     len(swiftkv_weight_mapping))
         # Call parent's load_weights method with the mapped weights
         return super().load_weights(swiftkv_weight_mapping.items())
 
